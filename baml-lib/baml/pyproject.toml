@@ -1,7 +1,7 @@
 [project]
-name = "lmnr_baml"
-version = "0.40.1"
-description = "LMNR BAML for Python"
+name = "baml_lib"
+version = "0.41.0"
+description = "BAML Library for Python"
 readme = "README.md"
 
 [build-system]
@@ -9,7 +9,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-python-source = "python_src"
+python-source = "src"
 # "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so).
 features = ["pyo3/extension-module"]
 

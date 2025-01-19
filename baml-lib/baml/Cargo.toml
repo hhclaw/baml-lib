@@ -1,6 +1,6 @@
 [package]
 edition = "2021"
-name = "lmnr-baml"
+name = "baml-lib"
 version.workspace = true
 authors.workspace = true
 description.workspace = true
@@ -11,13 +11,14 @@ description.workspace = true
 # The name of the native library. This is the name which will be used in Python to import the
 # library (i.e. `import string_sum`). If you change this, you must also change the name of the
 # `#[pymodule]` in `src/lib.rs`.
-name = "lmnr_baml"
+name = "baml_lib"
 # "cdylib" is necessary to produce a shared library for Python to import from.
 #
 #  Downstream Rust code (including code in `bin/`, `examples/`, and `tests/`) will not be able
-# to `use lmnr_baml;` unless the "rlib" or "lib" crate type is also included, e.g.:
+# to `use baml_lib;` unless the "rlib" or "lib" crate type is also included, e.g.:
 # crate-type = ["cdylib", "rlib"]
-crate-type = ["cdylib", "lib"]
+# crate-type = ["cdylib", "lib"]
+crate-type = ["cdylib"]
 
 ###
 

@@ -37,14 +37,14 @@ use python_interface::{render_prompt, validate_result};
 mod python_interface;
 
 #[pyo3::prelude::pymodule]
-fn lmnr_baml(m: &pyo3::Bound<'_, pyo3::prelude::PyModule>) -> pyo3::PyResult<()> {
+fn baml_lib(m: &pyo3::Bound<'_, pyo3::prelude::PyModule>) -> pyo3::PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(render_prompt, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(validate_result, m)?)?;
     Ok(())
 }
 
 // -------------------------------------------------------------------------------------------------
-// Laminar specific structs and functions
+// Exported structs and functions
 
 /// The context around a BAML schema.
 #[derive(Debug)]
@@ -79,20 +79,20 @@ impl BamlContext {
     }
 
     /// Render the prompt prefix for the output.
-    pub fn render_prompt(&self) -> anyhow::Result<String> {
+    pub fn render_prompt(&self, prefix: Option<String>, always_hoist_enums: Option<bool>) -> anyhow::Result<String> {
         let output = self.format.render(RenderOptions::new(
+            prefix.map(Some),
             None,
             None,
-            Some(Some(String::new())),
-            Some(true),
+            always_hoist_enums,
         ))?;
 
         Ok(output.unwrap_or_default())
     }
 
     /// Check the LLM output for validity.
-    pub fn validate_result(&self, result: &String) -> anyhow::Result<String> {
-        let result = jsonish::from_str(&self.format, &self.target, &result, false);
+    pub fn validate_result(&self, result: &String, allow_partials: bool) -> anyhow::Result<String> {
+        let result = jsonish::from_str(&self.format, &self.target, &result, allow_partials);
         result.map(|r| {
             let baml_value: BamlValue = r.into();
             // BAML serializes values using `serde_json::json!` which adds quotes around strings.
