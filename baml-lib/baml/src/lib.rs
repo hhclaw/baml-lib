@@ -1,16 +1,19 @@
 #![doc = include_str!("../README.md")]
 #![deny(rust_2018_idioms, unsafe_code)]
 
-use baml_types::{BamlValue, FieldType};
-use either::Either;
-use internal_baml_core::ast::{WithAttributes, WithName};
+use std::path::PathBuf;
+use baml_types::{BamlValue, FieldType, EvaluationContext};
+use serde_json;
+use internal_baml_core::ast::{WithName, SubType};
 pub use internal_baml_core::{
     self,
     internal_baml_diagnostics::{self, Diagnostics, SourceFile},
-    internal_baml_parser_database::{self},
+    internal_baml_parser_database::{self, TypeWalker},
     Configuration, ValidatedSchema,
 };
-use internal_baml_jinja::types::{OutputFormatContent, RenderOptions};
+use internal_baml_jinja::types::{OutputFormatContent, RenderOptions, Name};
+mod type_convert;
+use type_convert::to_raw_field_type;
 
 /// Parse and analyze a Prisma schema.
 // pub fn parse_and_validate_schema(
@@ -25,7 +28,9 @@ use internal_baml_jinja::types::{OutputFormatContent, RenderOptions};
 /// The most general API for dealing with Prisma schemas. It accumulates what analysis and
 /// validation information it can, and returns it along with any error and warning diagnostics.
 pub fn validate(schema_string: &String) -> ValidatedSchema {
-    internal_baml_core::validate(schema_string)
+    let pathbuf = PathBuf::new();
+    let file = SourceFile::from((&pathbuf, schema_string));
+    internal_baml_core::validate(pathbuf.as_path(), vec![file])
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -85,6 +90,8 @@ impl BamlContext {
             None,
             None,
             always_hoist_enums,
+            None,
+            None,
         ))?;
 
         Ok(output.unwrap_or_default())
@@ -97,8 +104,7 @@ impl BamlContext {
             let baml_value: BamlValue = r.into();
             // BAML serializes values using `serde_json::json!` which adds quotes around strings.
             // Enum result is a JSON string, so remove quotes around it.
-            baml_value
-                .serialize_json()
+            serde_json::json!(&baml_value)
                 .to_string()
                 .trim_matches('"')
                 .to_string()
@@ -112,8 +118,9 @@ impl BamlContext {
         let target = if let Some(target_name) = &target_name {
             let target = validated_schema.db.find_type_by_str(target_name).unwrap();
             match target {
-                Either::Left(cl) => FieldType::Class(cl.ast_class().name.name().to_string()),
-                Either::Right(enm) => FieldType::Enum(enm.ast_enum().name.name().to_string()),
+                TypeWalker::Class(cl) => FieldType::Class(cl.ast_type_block().name.name().to_string()),
+                TypeWalker::Enum(enm) => FieldType::Enum(enm.ast_type_block().name.name().to_string()),
+                TypeWalker::TypeAlias(alias) => FieldType::RecursiveTypeAlias(alias.name().to_string()),
             }
         } else {
             let first_class = validated_schema.db.walk_classes().next();
@@ -124,9 +131,9 @@ impl BamlContext {
                 ));
             }
             if let Some(cl) = first_class {
-                FieldType::Class(cl.ast_class().name.name().to_string())
+                FieldType::Class(cl.ast_type_block().name.name().to_string())
             } else {
-                FieldType::Enum(first_enum.unwrap().ast_enum().name.name().to_string())
+                FieldType::Enum(first_enum.unwrap().ast_type_block().name.name().to_string())
             }
         };
 
@@ -137,29 +144,33 @@ impl BamlContext {
         validated_schema: &ValidatedSchema,
         target: FieldType,
     ) -> OutputFormatContent {
+        let ctx = EvaluationContext::default();
         let enums = validated_schema
             .db
             .walk_enums()
             .map(|e| {
-                let ast_enum = e.ast_enum();
-                let values = ast_enum
-                    .iter_values()
-                    .map(|(_id, v)| {
-                        let name = internal_baml_jinja::Name::new(v.name().to_string());
+                let values = e.values()
+                    .map(|v| {
+                        let name = v.name().to_string();
+                        let alias = v.get_default_attributes()
+                            .map(|a| a.alias())
+                            .map(|al| al.as_ref().unwrap())
+                            .and_then(|d| d.as_str())
+                            .and_then(|r| r.resolve(&ctx).ok());
                         let description = v
-                            .attributes()
-                            .iter()
-                            .find(|a| a.name() == "description")
-                            .and_then(|a| a.arguments.iter().next())
-                            .and_then(|(_id, val)| val.value.as_string_value())
-                            .map(|ast_string_val| ast_string_val.0.to_string());
+                            .get_default_attributes()
+                            .map(|a| a.description())
+                            .map(|desc| desc.as_ref().unwrap())
+                            .map(|d| d.as_str())
+                            .and_then(|r| r?.resolve(&ctx).ok());
                         // let doc = v.documentation().map(|d| d.to_string());
-                        (name, description)
+                        (internal_baml_jinja::types::Name::new(alias.unwrap_or(name)), description)
                     })
                     .collect::<Vec<_>>();
-                internal_baml_jinja::Enum {
-                    name: ast_enum.name.name().to_string().into(),
+                internal_baml_jinja::types::Enum {
+                    name: Name::new(e.name().to_string()),
                     values,
+                    constraints: e.get_constraints(SubType::Enum).unwrap_or(vec![]),
                 }
             })
             .collect::<Vec<_>>();
@@ -168,28 +179,33 @@ impl BamlContext {
             .db
             .walk_classes()
             .map(|c| {
-                let ast_class = c.ast_class();
-                let fields = ast_class
-                    .iter_fields()
-                    .map(|(_id, f)| {
-                        let name = internal_baml_jinja::Name::new(f.name().to_string());
-                        let t = validated_schema.db.to_raw_field_type(&f.field_type);
+                let fields = c.static_fields()
+                    .map(|f| {
+                        let name = f.name().to_string();
+                        let t = f.r#type().clone().expect(&format!("Cannot retrieve type from field {}", f.name()));
+                        let field_type = to_raw_field_type(&t, &validated_schema.db);
+                        let alias = f.get_default_attributes()
+                            .map(|a| a.alias())
+                            .map(|al| al.as_ref().unwrap())
+                            .and_then(|d| d.as_str())
+                            .and_then(|r| r.resolve(&ctx).ok());
+
                         let description = f
-                            .attributes()
-                            .iter()
-                            .find(|a| a.name() == "description")
-                            .and_then(|a| a.arguments.iter().next())
-                            .and_then(|(_id, val)| val.value.as_string_value())
-                            .map(|ast_string_val| ast_string_val.0.to_string());
-                        (name, t, description)
+                            .get_default_attributes()
+                            .map(|a| a.description())
+                            .map(|desc| desc.as_ref().unwrap())
+                            .and_then(|d| d.as_str())
+                            .and_then(|r| r.resolve(&ctx).ok());
+                        (internal_baml_jinja::types::Name::new(alias.unwrap_or(name)), field_type, description)
                     })
                     .collect::<Vec<_>>();
-                internal_baml_jinja::Class {
-                    name: ast_class.name.name().to_string().into(),
+                internal_baml_jinja::types::Class {
+                    name: Name::new(c.name().to_string()),
                     fields,
+                    constraints: c.get_constraints(SubType::Class).unwrap_or(vec![]),
                 }
             })
             .collect::<Vec<_>>();
-        OutputFormatContent::new(enums, classes, target.clone())
+        OutputFormatContent::target(target.clone()).enums(enums).classes(classes).build()
     }
 }

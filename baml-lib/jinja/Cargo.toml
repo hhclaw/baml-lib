@@ -1,15 +1,19 @@
 [package]
-name = "internal-baml-jinja"
+name = "internal-baml-jinja-types"
 edition = "2021"
 version.workspace = true
 authors.workspace = true
 description.workspace = true
 license-file.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lints.rust]
+dead_code = "deny"
+elided_named_lifetimes = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
 
 [dependencies]
-baml-types = { path = "../baml-types", features = ["mini-jinja"] }
+baml-types = { path = "../baml-types" }
 # TODO: disable imports, etc
 minijinja = { version = "1.0.16", default-features = false, features = [
   "macros",
@@ -23,18 +27,22 @@ minijinja = { version = "1.0.16", default-features = false, features = [
   "unstable_machinery_serde",
   "custom_syntax",
   "internal_debug",
+  "deserialization",
   # We don't want to use these features:
   # multi_template
   # loader
   #
 ] }
+askama.workspace = true
 anyhow.workspace = true
 indexmap.workspace = true
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-log = "0.4.14"
+strum.workspace = true
 strsim = "0.11.1"
 colored = "2.1.0"
+regex.workspace = true
 
 [dev-dependencies]
 env_logger = "0.11.3"

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::{assert_correct_parser, ast::*, unreachable_rule};
 use internal_baml_diagnostics::{DatamodelError, Diagnostics, Span};
 use internal_baml_schema_ast::ast::{RawString, WithSpan};
@@ -19,8 +21,11 @@ fn pretty_print<'a>(pair: pest::iterators::Pair<'a, Rule>, indent_level: usize) 
     }
 }
 
-pub fn parse_prompt(raw_string: &RawString) -> Result<(PromptAst, Diagnostics), Diagnostics> {
-    let mut diagnostics = Diagnostics::new();
+pub fn parse_prompt(
+    root_path: &Path,
+    raw_string: &RawString,
+) -> Result<(PromptAst, Diagnostics), Diagnostics> {
+    let mut diagnostics = Diagnostics::new(root_path.to_path_buf());
 
     // Do not set diagnostics source here. Instead we should always use:
     // raw_string.to_span(...)
@@ -93,8 +98,7 @@ pub fn parse_prompt(raw_string: &RawString) -> Result<(PromptAst, Diagnostics), 
         Err(err) => {
             diagnostics.push_error(DatamodelError::new_parser_error(
                 format!(
-                    "Unabled to parse this raw string. Please file a bug.\n{}",
-                    err
+                    "Unabled to parse this raw string. Please file a bug.\n{err}"
                 ),
                 raw_string.span().clone(),
             ));
@@ -198,7 +202,7 @@ fn handle_print_block(
                 }
                 other => {
                     diagnostics.push_error(DatamodelError::new_parser_error(
-                        format!("unknown printer function name `print{}`. Did you mean print_type or print_enum?", other),
+                        format!("unknown printer function name `print{other}`. Did you mean print_type or print_enum?"),
                         raw_string.to_raw_span(current.as_span()),
                     ));
                 }
@@ -492,7 +496,7 @@ fn get_expected_from_error(positives: &[Rule]) -> String {
     let mut out = String::with_capacity(positives.len() * 6);
 
     for positive in positives {
-        write!(out, "{:?} ", positive).unwrap();
+        write!(out, "{positive:?} ").unwrap();
     }
 
     out

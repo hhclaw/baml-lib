@@ -1,28 +1,31 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 /// A Prisma schema document.
 #[derive(Clone)]
 pub struct SourceFile {
+    path: PathBuf,
     contents: Contents,
 }
 
 impl PartialEq for SourceFile {
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        self.path == other.path
     }
 }
 
 impl Eq for SourceFile {}
 
 impl SourceFile {
-    pub fn new_static(content: &'static str) -> Self {
+    pub fn new_static(path: PathBuf, content: &'static str) -> Self {
         Self {
+            path,
             contents: Contents::Static(content),
         }
     }
 
-    pub fn new_allocated(s: Arc<str>) -> Self {
+    pub fn new_allocated(path: PathBuf, s: Arc<str>) -> Self {
         Self {
+            path,
             contents: Contents::Allocated(s),
         }
     }
@@ -33,43 +36,51 @@ impl SourceFile {
             Contents::Allocated(ref s) => s,
         }
     }
+
+    pub fn path(&self) -> String {
+        self.path.to_string_lossy().to_string()
+    }
+
+    pub fn path_buf(&self) -> &PathBuf {
+        &self.path
+    }
 }
 
 impl fmt::Debug for SourceFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SourceFile {{ ... }}")?;
+        write!(f, "SourceFile {{ path: {:?}, contents: ... }}", self.path)?;
 
         Ok(())
     }
 }
 
-impl From<&str> for SourceFile {
-    fn from(s: &str) -> Self {
-        Self::new_allocated(Arc::from(s.to_owned().into_boxed_str()))
+impl From<(PathBuf, &str)> for SourceFile {
+    fn from((path, s): (PathBuf, &str)) -> Self {
+        Self::new_allocated(path.clone(), Arc::from(s.to_owned().into_boxed_str()))
     }
 }
 
-impl From<&String> for SourceFile {
-    fn from(s: &String) -> Self {
-        Self::new_allocated(Arc::from(s.to_owned().into_boxed_str()))
+impl From<(&PathBuf, &String)> for SourceFile {
+    fn from((path, s): (&PathBuf, &String)) -> Self {
+        Self::new_allocated(path.clone(), Arc::from(s.to_owned().into_boxed_str()))
     }
 }
 
-impl From<Box<str>> for SourceFile {
-    fn from(s: Box<str>) -> Self {
-        Self::new_allocated(Arc::from(s))
+impl From<(PathBuf, Box<str>)> for SourceFile {
+    fn from((path, s): (PathBuf, Box<str>)) -> Self {
+        Self::new_allocated(path, Arc::from(s))
     }
 }
 
-impl From<Arc<str>> for SourceFile {
-    fn from(s: Arc<str>) -> Self {
-        Self::new_allocated(s)
+impl From<(PathBuf, Arc<str>)> for SourceFile {
+    fn from((path, s): (PathBuf, Arc<str>)) -> Self {
+        Self::new_allocated(path, s)
     }
 }
 
-impl From<String> for SourceFile {
-    fn from(s: String) -> Self {
-        Self::new_allocated(Arc::from(s.into_boxed_str()))
+impl From<(PathBuf, String)> for SourceFile {
+    fn from((path, s): (PathBuf, String)) -> Self {
+        Self::new_allocated(path, Arc::from(s.into_boxed_str()))
     }
 }
 

@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 
-use baml_types::{BamlImage, BamlMap, BamlValue};
+use baml_types::{BamlMap, BamlMedia, BamlValue, BamlValueWithMeta, Constraint, JinjaExpression};
+use serde_json::json;
+use strsim::jaro;
 
 use super::{
+    coercer::ParsingError,
     deserialize_flags::{DeserializerConditions, Flag},
     score::WithScore,
 };
@@ -26,10 +29,26 @@ pub enum BamlValueWithFlags {
         BamlMap<String, BamlValueWithFlags>,
     ),
     Null(DeserializerConditions),
-    Image(ValueWithFlags<BamlImage>),
+    Media(ValueWithFlags<BamlMedia>),
 }
 
 impl BamlValueWithFlags {
+    pub fn is_composite(&self) -> bool {
+        match self {
+            BamlValueWithFlags::String(_)
+            | BamlValueWithFlags::Int(_)
+            | BamlValueWithFlags::Float(_)
+            | BamlValueWithFlags::Bool(_)
+            | BamlValueWithFlags::Null(_)
+            | BamlValueWithFlags::Enum(_, _) => false,
+
+            BamlValueWithFlags::List(_, _)
+            | BamlValueWithFlags::Map(_, _)
+            | BamlValueWithFlags::Class(_, _, _)
+            | BamlValueWithFlags::Media(_) => true,
+        }
+    }
+
     pub fn score(&self) -> i32 {
         match self {
             BamlValueWithFlags::String(f) => f.score(),
@@ -50,15 +69,190 @@ impl BamlValueWithFlags {
                 f.score() + items.iter().map(|(_, v)| v.score()).sum::<i32>()
             }
             BamlValueWithFlags::Null(f) => f.score(),
-            BamlValueWithFlags::Image(f) => f.score(),
+            BamlValueWithFlags::Media(f) => f.score(),
+        }
+    }
+
+    pub fn conditions(&self) -> &DeserializerConditions {
+        match self {
+            BamlValueWithFlags::String(v) => &v.flags,
+            BamlValueWithFlags::Int(v) => &v.flags,
+            BamlValueWithFlags::Float(v) => &v.flags,
+            BamlValueWithFlags::Bool(v) => &v.flags,
+            BamlValueWithFlags::List(v, _) => v,
+            BamlValueWithFlags::Map(v, _) => v,
+            BamlValueWithFlags::Enum(_, v) => &v.flags,
+            BamlValueWithFlags::Class(_, v, _) => v,
+            BamlValueWithFlags::Null(v) => v,
+            BamlValueWithFlags::Media(v) => &v.flags,
+        }
+    }
+}
+
+trait ParsingErrorToUiJson {
+    fn to_ui_json(&self) -> serde_json::Value;
+}
+
+impl ParsingErrorToUiJson for ParsingError {
+    fn to_ui_json(&self) -> serde_json::Value {
+        json!({
+            if self.scope.is_empty() {
+                "<root>".to_string()
+            } else {
+                self.scope.join(".")
+            }: self.reason,
+            "causes": self.causes.iter().map(|c| c.to_ui_json()).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl BamlValueWithFlags {
+    pub fn explanation_json(&self) -> Vec<serde_json::Value> {
+        let mut expl = vec![];
+        self.explanation_impl(vec!["<root>".to_string()], &mut expl);
+        expl.into_iter().map(|e| e.to_ui_json()).collect::<Vec<_>>()
+    }
+
+    pub fn explanation_impl(&self, scope: Vec<String>, expls: &mut Vec<ParsingError>) {
+        match self {
+            BamlValueWithFlags::String(v) => {
+                let causes = v.flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing string".to_string(),
+                        causes,
+                    });
+                }
+            }
+            BamlValueWithFlags::Int(v) => {
+                let causes = v.flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing int".to_string(),
+                        causes,
+                    });
+                }
+            }
+            BamlValueWithFlags::Float(v) => {
+                let causes = v.flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing float".to_string(),
+                        causes,
+                    });
+                }
+            }
+            BamlValueWithFlags::Bool(v) => {
+                let causes = v.flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing bool".to_string(),
+                        causes,
+                    });
+                }
+            }
+            BamlValueWithFlags::List(flags, values) => {
+                let causes = flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing list".to_string(),
+                        causes,
+                    });
+                }
+                for (i, value) in values.iter().enumerate() {
+                    let mut scope = scope.clone();
+                    scope.push(format!("parsed:{}", i));
+                    value.explanation_impl(scope, expls);
+                }
+            }
+            BamlValueWithFlags::Map(flags, kv) => {
+                let causes = flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing map".to_string(),
+                        causes,
+                    });
+                }
+                for (k, (v_flags, v)) in kv.iter() {
+                    let causes = v_flags.explanation();
+                    if !causes.is_empty() {
+                        expls.push(ParsingError {
+                            scope: scope.clone(),
+                            reason: format!("error while parsing value for map key '{}'", k),
+                            causes,
+                        });
+                    }
+                    let mut scope = scope.clone();
+                    scope.push(format!("parsed:{}", k));
+                    v.explanation_impl(scope, expls);
+                }
+            }
+            BamlValueWithFlags::Enum(enum_name, v) => {
+                let causes = v.flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: format!("error while parsing {enum_name} enum value"),
+                        causes,
+                    });
+                }
+            }
+            BamlValueWithFlags::Class(class_name, v, fields) => {
+                let causes = v.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: format!("error while parsing class {}", class_name),
+                        causes,
+                    });
+                }
+                for (k, v) in fields.iter() {
+                    let mut scope = scope.clone();
+                    scope.push(k.to_string());
+                    v.explanation_impl(scope, expls);
+                }
+            }
+
+            BamlValueWithFlags::Null(v) => {
+                let causes = v.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing null".to_string(),
+                        causes,
+                    });
+                }
+            }
+            BamlValueWithFlags::Media(v) => {
+                let causes = v.flags.explanation();
+                if !causes.is_empty() {
+                    expls.push(ParsingError {
+                        scope: scope.clone(),
+                        reason: "error while parsing media".to_string(),
+                        causes,
+                    });
+                }
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ValueWithFlags<T> {
-    value: T,
+    pub value: T,
     pub(super) flags: DeserializerConditions,
+}
+
+impl<T> ValueWithFlags<T> {
+    pub fn value(&self) -> &T {
+        &self.value
+    }
 }
 
 impl<T> From<T> for ValueWithFlags<T> {
@@ -114,7 +308,7 @@ impl From<BamlValueWithFlags> for BamlValue {
                 BamlValue::Class(s, m.into_iter().map(|(k, v)| (k, v.into())).collect())
             }
             BamlValueWithFlags::Null(_) => BamlValue::Null,
-            BamlValueWithFlags::Image(i) => BamlValue::Image(i.value),
+            BamlValueWithFlags::Media(i) => BamlValue::Media(i.value),
         }
     }
 }
@@ -126,9 +320,7 @@ impl From<&BamlValueWithFlags> for BamlValue {
             BamlValueWithFlags::Int(i) => BamlValue::Int(i.value),
             BamlValueWithFlags::Float(f) => BamlValue::Float(f.value),
             BamlValueWithFlags::Bool(b) => BamlValue::Bool(b.value),
-            BamlValueWithFlags::List(_, v) => {
-                BamlValue::List(v.into_iter().map(|x| x.into()).collect())
-            }
+            BamlValueWithFlags::List(_, v) => BamlValue::List(v.iter().map(|x| x.into()).collect()),
             BamlValueWithFlags::Map(_, m) => BamlValue::Map(
                 m.into_iter()
                     .map(|(k, (_, v))| (k.clone(), v.into()))
@@ -140,7 +332,7 @@ impl From<&BamlValueWithFlags> for BamlValue {
                 m.into_iter().map(|(k, v)| (k.clone(), v.into())).collect(),
             ),
             BamlValueWithFlags::Null(_) => BamlValue::Null,
-            BamlValueWithFlags::Image(i) => BamlValue::Image(i.value.clone()),
+            BamlValueWithFlags::Media(i) => BamlValue::Media(i.value.clone()),
         }
     }
 }
@@ -157,11 +349,11 @@ impl BamlValueWithFlags {
             BamlValueWithFlags::Enum(_, v) => v.flags.add_flag(flag),
             BamlValueWithFlags::Class(_, v, _) => v.add_flag(flag),
             BamlValueWithFlags::Null(v) => v.add_flag(flag),
-            BamlValueWithFlags::Image(v) => v.flags.add_flag(flag),
+            BamlValueWithFlags::Media(v) => v.flags.add_flag(flag),
         }
     }
 
-    fn r#type(&self) -> String {
+    pub(super) fn r#type(&self) -> String {
         match self {
             BamlValueWithFlags::String(_) => "String".to_string(),
             BamlValueWithFlags::Int(_) => "Int".to_string(),
@@ -181,7 +373,7 @@ impl BamlValueWithFlags {
             BamlValueWithFlags::Enum(n, _) => format!("Enum {n}"),
             BamlValueWithFlags::Class(c, _, _) => format!("Class {c}"),
             BamlValueWithFlags::Null(_) => "Null".to_string(),
-            BamlValueWithFlags::Image(_) => "Image".to_string(),
+            BamlValueWithFlags::Media(_) => "Image".to_string(),
         }
     }
 }
@@ -215,7 +407,7 @@ impl std::fmt::Display for BamlValueWithFlags {
                 }
             }
             BamlValueWithFlags::List(flags, v) => {
-                write!(f, "\n")?;
+                writeln!(f)?;
                 for (idx, item) in v.iter().enumerate() {
                     writeln!(f, "  {idx}: {}", item.to_string().replace("\n", "  \n"))?;
                 }
@@ -224,7 +416,7 @@ impl std::fmt::Display for BamlValueWithFlags {
                 }
             }
             BamlValueWithFlags::Map(_, v) => {
-                write!(f, "\n")?;
+                writeln!(f)?;
                 for (key, value) in v {
                     writeln!(f, "{}: {}", key, value.1)?;
                 }
@@ -236,8 +428,8 @@ impl std::fmt::Display for BamlValueWithFlags {
                 }
             }
             BamlValueWithFlags::Class(_, flags, v) => {
-                write!(f, "\n")?;
-                for (_idx, (k, v)) in v.iter().enumerate() {
+                writeln!(f)?;
+                for (k, v) in v.iter() {
                     writeln!(f, "  KV {}", k.to_string().replace("\n", "\n  "))?;
                     writeln!(f, "  {}", v.to_string().replace("\n", "\n  "))?;
                 }
@@ -251,7 +443,7 @@ impl std::fmt::Display for BamlValueWithFlags {
                     write!(f, "\n  {}", flags.to_string().replace("\n", "\n  "))?;
                 }
             }
-            BamlValueWithFlags::Image(v) => {
+            BamlValueWithFlags::Media(v) => {
                 write!(f, "{:#?}", v.value)?;
                 if !v.flags.flags.is_empty() {
                     write!(f, "\n  {}", v.flags.to_string().replace("\n", "\n  "))?;
@@ -260,5 +452,35 @@ impl std::fmt::Display for BamlValueWithFlags {
         };
 
         Ok(())
+    }
+}
+
+impl From<BamlValueWithFlags> for BamlValueWithMeta<Vec<(String, JinjaExpression, bool)>> {
+    fn from(baml_value: BamlValueWithFlags) -> Self {
+        use BamlValueWithFlags::*;
+        let c = baml_value.conditions().constraint_results();
+        match baml_value {
+            String(ValueWithFlags { value, .. }) => BamlValueWithMeta::String(value, c),
+            Int(ValueWithFlags { value, .. }) => BamlValueWithMeta::Int(value, c),
+            Float(ValueWithFlags { value, .. }) => BamlValueWithMeta::Float(value, c),
+            Bool(ValueWithFlags { value, .. }) => BamlValueWithMeta::Bool(value, c),
+            Map(_, values) => BamlValueWithMeta::Map(
+                values.into_iter().map(|(k, v)| (k, v.1.into())).collect(),
+                c,
+            ), // TODO: (Greg) I discard the DeserializerConditions tupled up with the value of the BamlMap. I'm not sure why BamlMap value is (DeserializerContitions, BamlValueWithFlags) in the first place.
+            List(_, values) => {
+                BamlValueWithMeta::List(values.into_iter().map(|v| v.into()).collect(), c)
+            }
+            Media(ValueWithFlags { value, .. }) => BamlValueWithMeta::Media(value, c),
+            Enum(enum_name, ValueWithFlags { value, .. }) => {
+                BamlValueWithMeta::Enum(enum_name, value, c)
+            }
+            Class(class_name, _, fields) => BamlValueWithMeta::Class(
+                class_name,
+                fields.into_iter().map(|(k, v)| (k, v.into())).collect(),
+                c,
+            ),
+            Null(_) => BamlValueWithMeta::Null(c),
+        }
     }
 }

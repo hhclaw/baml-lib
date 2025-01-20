@@ -1,21 +1,32 @@
 mod array_helper;
 mod coerce_array;
+mod coerce_literal;
+mod coerce_map;
 mod coerce_optional;
 mod coerce_primitive;
 mod coerce_union;
 mod field_type;
 mod ir_ref;
+mod match_string;
+
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Result;
+
+use baml_types::{BamlValue, Constraint, JinjaExpression};
 use internal_baml_jinja::types::OutputFormatContent;
 
-use internal_baml_core::ir::FieldType;
+use internal_baml_core::ir::{jinja_helpers::evaluate_predicate, FieldType};
+
+use crate::jsonish;
 
 use super::types::BamlValueWithFlags;
 
 pub struct ParsingContext<'a> {
-    scope: Vec<String>,
-    of: &'a OutputFormatContent,
-    allow_partials: bool,
+    pub scope: Vec<String>,
+    visited: HashSet<(String, jsonish::Value)>,
+    pub of: &'a OutputFormatContent,
+    pub allow_partials: bool,
 }
 
 impl ParsingContext<'_> {
@@ -26,9 +37,10 @@ impl ParsingContext<'_> {
         self.scope.join(".")
     }
 
-    pub(crate) fn new<'a>(of: &'a OutputFormatContent, allow_partials: bool) -> ParsingContext<'a> {
+    pub(crate) fn new(of: &OutputFormatContent, allow_partials: bool) -> ParsingContext<'_> {
         ParsingContext {
             scope: Vec::new(),
+            visited: HashSet::new(),
             of,
             allow_partials,
         }
@@ -39,6 +51,24 @@ impl ParsingContext<'_> {
         new_scope.push(scope.to_string());
         ParsingContext {
             scope: new_scope,
+            visited: self.visited.clone(),
+            of: self.of,
+            allow_partials: self.allow_partials,
+        }
+    }
+
+    // TODO: This function and `enter_scope` are clonning both the scope vector
+    // and visited hash set each time. Maybe it can be optimized with interior
+    // mutability or something.
+    pub(crate) fn visit_class_value_pair(
+        &self,
+        cls_value_pair: (String, jsonish::Value),
+    ) -> ParsingContext {
+        let mut new_visited = self.visited.clone();
+        new_visited.insert(cls_value_pair);
+        ParsingContext {
+            scope: self.scope.clone(),
+            visited: new_visited,
             of: self.of,
             allow_partials: self.allow_partials,
         }
@@ -57,10 +87,11 @@ impl ParsingContext<'_> {
                     if acc.is_empty() {
                         return f.to_string();
                     }
-                    return format!("{}, {}", acc, f);
+                    format!("{}, {}", acc, f)
                 })
             ),
             scope: self.scope.clone(),
+            causes: vec![],
         }
     }
 
@@ -69,40 +100,18 @@ impl ParsingContext<'_> {
         summary: &str,
         error: impl IntoIterator<Item = &'a ParsingError>,
     ) -> ParsingError {
-        let reasons = error
-            .into_iter()
-            .map(|e| {
-                // Strip all shared prefixes (assume the same unless different length)
-                let remaining =
-                    e.scope
-                        .iter()
-                        .skip(self.scope.len())
-                        .fold("".to_string(), |acc, f| {
-                            if acc.is_empty() {
-                                return f.clone();
-                            }
-                            return format!("{}.{}", acc, f);
-                        });
-
-                if remaining.is_empty() {
-                    return e.reason.clone();
-                } else {
-                    // Prefix each new lines in e.reason with "  "
-                    return format!("{}: {}", remaining, e.reason.replace("\n", "\n  "));
-                }
-            })
-            .collect::<Vec<_>>();
-
         ParsingError {
-            reason: format!("{}:\n{}", summary, reasons.join("\n").replace("\n", "\n  ")),
+            reason: summary.to_string(),
             scope: self.scope.clone(),
+            causes: error.into_iter().cloned().collect(),
         }
     }
 
     pub(crate) fn error_unexpected_empty_array(&self, target: &FieldType) -> ParsingError {
         ParsingError {
-            reason: format!("Expected {}, got empty array", target.to_string()),
+            reason: format!("Expected {}, got empty array", target),
             scope: self.scope.clone(),
+            causes: vec![],
         }
     }
 
@@ -110,6 +119,7 @@ impl ParsingContext<'_> {
         ParsingError {
             reason: format!("Expected {}, got null", target),
             scope: self.scope.clone(),
+            causes: vec![],
         }
     }
 
@@ -117,56 +127,54 @@ impl ParsingContext<'_> {
         ParsingError {
             reason: "Image type is not supported here".to_string(),
             scope: self.scope.clone(),
+            causes: vec![],
         }
     }
 
-    pub(crate) fn error_missing_required_field<T: AsRef<str>>(
-        &self,
-        unparsed_fields: &[(T, T)],
-        missing_fields: &[T],
-    ) -> ParsingError {
-        let fields = missing_fields
-            .iter()
-            .map(|c| c.as_ref())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let missing_error = match missing_fields.len() {
-            0 => None,
-            1 => Some(format!("Missing required field: {}", fields)),
-            _ => Some(format!("Missing required fields: {}", fields)),
-        };
-
-        let unparsed = unparsed_fields
-            .iter()
-            .map(|(k, v)| format!("{}: {}", k.as_ref(), v.as_ref().replace("\n", "\n  ")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let unparsed_error = match unparsed_fields.len() {
-            0 => None,
-            1 => Some(format!(
-                "Unparsed field: {}\n  {}",
-                unparsed_fields[0].0.as_ref(),
-                unparsed_fields[0].1.as_ref().replace("\n", "\n  ")
-            )),
-            _ => Some(format!(
-                "Unparsed fields:\n{}\n  {}",
-                unparsed_fields
-                    .iter()
-                    .map(|(k, _)| k.as_ref())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                unparsed.replace("\n", "\n  ")
-            )),
-        };
-
+    pub(crate) fn error_audio_not_supported(&self) -> ParsingError {
         ParsingError {
-            reason: match (missing_error, unparsed_error) {
-                (Some(m), Some(u)) => format!("{}\n{}", m, u),
-                (Some(m), None) => m,
-                (None, Some(u)) => u,
-                (None, None) => "Unexpected error".to_string(),
-            },
+            reason: "Audio type is not supported here".to_string(),
             scope: self.scope.clone(),
+            causes: vec![],
+        }
+    }
+
+    pub(crate) fn error_map_must_have_supported_key(&self, key_type: &FieldType) -> ParsingError {
+        ParsingError {
+            reason: format!(
+                "Maps may only have strings, enums or literal strings for keys, but got {key_type}"
+            ),
+            scope: self.scope.clone(),
+            causes: vec![],
+        }
+    }
+
+    pub(crate) fn error_missing_required_field(
+        &self,
+        unparsed: Vec<(String, &ParsingError)>,
+        missing: Vec<String>,
+        _item: Option<&crate::jsonish::Value>,
+    ) -> ParsingError {
+        ParsingError {
+            reason: format!(
+                "Failed while parsing required fields: missing={}, unparsed={}",
+                missing.len(),
+                unparsed.len()
+            ),
+            scope: self.scope.clone(),
+            causes: missing
+                .into_iter()
+                .map(|k| ParsingError {
+                    scope: self.scope.clone(),
+                    reason: format!("Missing required field: {}", k),
+                    causes: vec![],
+                })
+                .chain(unparsed.into_iter().map(|(k, e)| ParsingError {
+                    scope: self.scope.clone(),
+                    reason: format!("Failed to parse field {}: {}", k, e),
+                    causes: vec![e.clone()],
+                }))
+                .collect(),
         }
     }
 
@@ -176,8 +184,17 @@ impl ParsingContext<'_> {
         got: &T,
     ) -> ParsingError {
         ParsingError {
-            reason: format!("Expected {}, got {}.\n{:#?}", target, got, got),
+            reason: format!(
+                "Expected {}, got {:?}.",
+                match target {
+                    FieldType::Enum(_) => format!("{} enum value", target),
+                    FieldType::Class(_) => format!("{}", target),
+                    _ => format!("{target}"),
+                },
+                got
+            ),
             scope: self.scope.clone(),
+            causes: vec![],
         }
     }
 
@@ -185,27 +202,46 @@ impl ParsingContext<'_> {
         ParsingError {
             reason: format!("Internal error: {}", error),
             scope: self.scope.clone(),
+            causes: vec![],
+        }
+    }
+
+    pub(crate) fn error_circular_reference(
+        &self,
+        cls: &str,
+        value: &jsonish::Value,
+    ) -> ParsingError {
+        ParsingError {
+            reason: format!("Circular reference detected for class-value pair {cls} <-> {value}"),
+            scope: self.scope.clone(),
+            causes: vec![],
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsingError {
-    reason: String,
-    scope: Vec<String>,
+    pub scope: Vec<String>,
+    pub reason: String,
+    pub causes: Vec<ParsingError>,
 }
 
 impl std::fmt::Display for ParsingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.scope.is_empty() {
-            return write!(f, "Error parsing '<root>': {}", self.reason);
-        }
         write!(
             f,
-            "Error parsing '{}': {}",
-            self.scope.join("."),
+            "{}: {}",
+            if self.scope.is_empty() {
+                "<root>".to_string()
+            } else {
+                self.scope.join(".")
+            },
             self.reason
-        )
+        )?;
+        for cause in &self.causes {
+            write!(f, "\n  - {}", format!("{}", cause).replace("\n", "\n  "))?;
+        }
+        Ok(())
     }
 }
 
@@ -222,4 +258,26 @@ pub trait TypeCoercer {
 
 pub trait DefaultValue {
     fn default_value(&self, error: Option<&ParsingError>) -> Option<BamlValueWithFlags>;
+}
+
+/// Run all checks and asserts for a value at a given type.
+/// This function only runs checks on the top-level node of the `BamlValue`.
+/// Checks on nested fields, list items etc. are not run here.
+///
+/// For a function that traverses a whole `BamlValue` looking for failed asserts,
+/// see `first_failing_assert_nested`.
+pub fn run_user_checks(
+    baml_value: &BamlValue,
+    type_: &FieldType,
+) -> Result<Vec<(Constraint, bool)>> {
+    match type_ {
+        FieldType::Constrained { constraints, .. } => constraints
+            .iter()
+            .map(|constraint| {
+                let result = evaluate_predicate(baml_value, &constraint.expression)?;
+                Ok((constraint.clone(), result))
+            })
+            .collect::<Result<Vec<_>>>(),
+        _ => Ok(vec![]),
+    }
 }

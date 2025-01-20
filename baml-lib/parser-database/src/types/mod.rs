@@ -1,49 +1,93 @@
-use std::collections::{HashMap, HashSet};
+use ouroboros::self_referencing;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+use std::ops::Deref;
 
-use crate::coerce;
+use crate::types::configurations::visit_test_case;
+use crate::{coerce, ParserDatabase, Tarjan};
 use crate::{context::Context, DatamodelError};
 
+use baml_types::Constraint;
+use baml_types::{StringOr, UnresolvedValue};
 use indexmap::IndexMap;
-use internal_baml_diagnostics::{DatamodelWarning, Span};
+use internal_baml_diagnostics::{Diagnostics, Span};
 use internal_baml_prompt_parser::ast::{ChatBlock, PrinterBlock, Variable};
 use internal_baml_schema_ast::ast::{
-    self, AdapterId, ClassId, ConfigurationId, EnumId, EnumValueId, Expression, FieldId, FieldType,
-    RawString, SerializerFieldId, VariantConfigId, VariantSerializerId, WithIdentifier, WithName,
-    WithSpan,
+    self, Expression, FieldId, FieldType, RawString, TypeAliasId, ValExpId, WithIdentifier,
+    WithName, WithSpan,
 };
+use internal_llm_client::{ClientProvider, PropertyHandler, UnresolvedClientProperty};
 
 mod configurations;
 mod prompt;
-mod to_string_attributes;
 mod types;
 
-use prompt::validate_prompt;
-
-pub use to_string_attributes::{
-    DynamicStringAttributes, StaticStringAttributes, ToStringAttributes,
-};
+pub use crate::attributes::Attributes;
 pub(crate) use types::EnumAttributes;
 pub(crate) use types::*;
+
+use self::configurations::visit_retry_policy;
 
 pub(super) fn resolve_types(ctx: &mut Context<'_>) {
     for (top_id, top) in ctx.ast.iter_tops() {
         match (top_id, top) {
-            (_, ast::Top::Enum(enm)) => visit_enum(enm, ctx),
-            (ast::TopId::Class(idx), ast::Top::Class(model)) => visit_class(idx, model, ctx),
+            (ast::TopId::Enum(idx), ast::Top::Enum(model)) => visit_enum(idx, model, ctx),
+            (_, ast::Top::Enum(_)) => unreachable!("Enum misconfigured"),
+
+            (ast::TopId::Class(idx), ast::Top::Class(model)) => {
+                visit_class(idx, model, ctx);
+            }
             (_, ast::Top::Class(_)) => unreachable!("Class misconfigured"),
+
+            (ast::TopId::TypeAlias(idx), ast::Top::TypeAlias(assignment)) => {
+                visit_type_alias(idx, assignment, ctx);
+            }
+            (_, ast::Top::TypeAlias(assignment)) => unreachable!("Type alias misconfigured"),
+
             (ast::TopId::TemplateString(idx), ast::Top::TemplateString(template_string)) => {
                 visit_template_string(idx, template_string, ctx)
             }
             (_, ast::Top::TemplateString(_)) => unreachable!("TemplateString misconfigured"),
-            (ast::TopId::Variant(idx), ast::Top::Variant(variant)) => {
-                visit_variant(idx, variant, ctx)
+
+            (ast::TopId::Function(idx), ast::Top::Function(function)) => {
+                visit_function(idx, function, ctx)
             }
-            (_, ast::Top::Variant(_)) => unreachable!("Variant misconfigured"),
-            (ast::TopId::Config((idx, _)), ast::Top::Config(cfg)) => {
-                visit_config(idx, cfg, ctx);
+            (_, ast::Top::Function(_)) => unreachable!("Function misconfigured"),
+            (ast::TopId::Client(idx), ast::Top::Client(client)) => {
+                visit_client(idx, client, ctx);
             }
-            (_, ast::Top::Config(_)) => unreachable!("Config misconfigured"),
+
+            (_, ast::Top::Client(_)) => unreachable!("Client misconfigured"),
+            (ast::TopId::RetryPolicy(idx), ast::Top::RetryPolicy(config)) => {
+                visit_retry_policy(idx, config, ctx);
+            }
+            (_, ast::Top::RetryPolicy(_)) => unreachable!("RetryPolicy misconfigured"),
+            (ast::TopId::TestCase(idx), ast::Top::TestCase(config)) => {
+                visit_test_case(idx, config, ctx);
+            }
+            (_, ast::Top::TestCase(_)) => unreachable!("TestCase misconfigured"),
+
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn resolve_type_aliases(ctx: &mut Context<'_>) {
+    // Since Jinja needs this information before we can run the cycles
+    // validation code, we'll temporarily store invalid cycles here. They will
+    // be reported later in the cycle validation.
+    //
+    // TODO: Find a way to disambiguate between structural and non-structural
+    // cycles so that Jinja validation can report usage of infinite cycles.
+    ctx.types.recursive_alias_cycles = Tarjan::components(&ctx.types.type_alias_dependencies);
+
+    // Resolve type aliases.
+    // Cycles are already computed so this should not stack overflow.
+    for alias_id in ctx.types.type_alias_dependencies.keys() {
+        // We can ignore the error here because it's already reported in the
+        // diagnostics at [`visit_type_alias`].
+        if let Ok(resolved) = resolve_type_alias(&ctx.ast[*alias_id].value, &ctx) {
+            ctx.types.resolved_type_aliases.insert(*alias_id, resolved);
         }
     }
 }
@@ -84,7 +128,7 @@ impl Hash for PromptVariable {
     }
 }
 
-impl<'a> PromptVariable {
+impl PromptVariable {
     /// Unique Key
     pub fn key(&self) -> String {
         match self {
@@ -103,19 +147,6 @@ pub struct StringValue {
     pub key_span: Span,
 }
 
-#[derive(Debug)]
-pub struct VariantProperties {
-    pub client: StringValue,
-    pub prompt: StringValue,
-    pub prompt_replacements: Vec<PromptVariable>,
-    pub replacers: (
-        HashMap<Variable, String>,
-        HashMap<PrinterBlock, String>,
-        Vec<ChatBlock>,
-    ),
-    pub output_adapter: Option<(AdapterId, Vec<RawString>)>,
-}
-
 /// The representation of a prompt.
 pub enum PromptAst<'a> {
     /// For single string prompts
@@ -127,99 +158,24 @@ pub enum PromptAst<'a> {
     Chat(Vec<(Option<&'a ChatBlock>, String)>, Vec<(String, String)>),
 }
 
-impl VariantProperties {
-    pub fn output_adapter_for_language(&self, language: &str) -> Option<&str> {
-        self.output_adapter.as_ref().and_then(|f| {
-            f.1.iter()
-                .find(|r| r.language.as_ref().map(|(l, _)| l.as_str()) == Some(language))
-                .map(|r| r.value())
-        })
-    }
-
-    pub fn to_prompt(&self) -> PromptAst<'_> {
-        let (input, output, chats) = &self.replacers;
-
-        // Replace all the inputs with the input replacers
-        let mut used_inputs = vec![];
-        let prompt = input
-            .iter()
-            .fold(self.prompt.value.clone(), |prompt, (k, val)| {
-                // Only add the input if it's used in the prompt
-                let key = k.key();
-                if prompt.contains(&key) {
-                    used_inputs.push((key.clone(), val.clone()));
-                    prompt
-                } else {
-                    prompt
-                }
-            });
-        // Replace all the outputs with the output replacers
-        let prompt = output.iter().fold(prompt, |prompt, (k, val)| {
-            prompt.replace(&k.key(), &val.to_string())
-        });
-
-        used_inputs.sort();
-
-        if chats.is_empty() {
-            PromptAst::String(prompt, used_inputs)
-        } else {
-            // Split the prompt into parts based on the chat blocks.
-            let mut last_idx = 0;
-            let mut parts = vec![];
-            for chat in chats {
-                let splitter = chat.key();
-                let idx = prompt[last_idx..].find(&splitter);
-                if let Some(idx) = idx {
-                    parts.push((
-                        Some(chat),
-                        (idx + last_idx, idx + last_idx + splitter.len()),
-                    ));
-                    last_idx += idx + splitter.len();
-                }
-            }
-
-            match parts.first() {
-                // If the first chat block is not at the start of the prompt, add the first part.
-                Some(&(Some(_), (start, _))) if start > 0 => {
-                    parts.insert(0, (None, (0, 0)));
-                }
-                Some(_) => {}
-                _ => unreachable!("At least one chat block should exist"),
-            }
-
-            // Each chat block owns a part of the prompt. until the next chat block.
-            PromptAst::Chat(
-                parts
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, &(chat, (_, start)))| {
-                        let end = if idx + 1 < parts.len() {
-                            parts[idx + 1].1 .0
-                        } else {
-                            prompt.len()
-                        };
-
-                        let p = prompt[start..end].trim();
-                        if p.is_empty() {
-                            // info!("Skipping empty prompt part: {} {} {}", idx, start, end);
-                            None
-                        } else {
-                            Some((chat, p.to_string()))
-                        }
-                    })
-                    .collect(),
-                used_inputs,
-            )
-        }
-    }
+/// The properties of the client.
+/// This is highly dangerous, but i did this to only copy the options once.
+pub struct ClientProperties {
+    /// The provider for the client, e.g. baml-openai-chat
+    pub provider: (ClientProvider, Span),
+    /// The retry policy for the client
+    pub retry_policy: Option<(String, Span)>,
+    /// The options for the client
+    pub options: UnresolvedClientProperty<Span>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TestCase {
     pub functions: Vec<(String, Span)>,
     // The span is the span of the argument (the expression has its own span)
-    pub args: IndexMap<String, (Span, Expression)>,
+    pub args: IndexMap<String, (Span, UnresolvedValue<Span>)>,
     pub args_field_span: Span,
+    pub constraints: Vec<(Constraint, Span, Span)>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,14 +203,14 @@ impl PrinterType {
 }
 
 /// How to retry a request.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RetryPolicy {
     /// The maximum number of retries.
     pub max_retries: u32,
     /// The strategy to use.
     pub strategy: RetryPolicyStrategy,
     /// Any additional options.
-    pub options: Option<Vec<((String, Span), Expression)>>,
+    pub options: Option<IndexMap<String, (Span, UnresolvedValue<Span>)>>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -285,72 +241,93 @@ pub struct ExponentialBackoffStrategy {
 }
 
 #[derive(Debug, Clone)]
+pub struct FunctionType {
+    pub dependencies: (HashSet<String>, HashSet<String>),
+    pub prompt: Option<RawString>,
+    pub client: Option<(String, Span)>,
+}
+
+#[derive(Debug, Clone)]
 pub struct TemplateStringProperties {
+    // Not all template strings have names (e.g. function prompt)
+    pub name: Option<String>,
+    pub type_dependencies: HashSet<String>,
     /// This is dedented and trimmed.
     pub template: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct Types {
-    pub(super) enum_attributes: HashMap<ast::EnumId, EnumAttributes>,
-    pub(super) class_attributes: HashMap<ast::ClassId, ClassAttributes>,
-    pub(super) class_dependencies: HashMap<ast::ClassId, HashSet<String>>,
-    pub(super) variant_attributes: HashMap<ast::VariantConfigId, VariantAttributes>,
-    pub(super) variant_properties: HashMap<ast::VariantConfigId, VariantProperties>,
-    pub(super) retry_policies: HashMap<ast::ConfigurationId, RetryPolicy>,
-    pub(super) printers: HashMap<ast::ConfigurationId, PrinterType>,
-    pub(super) test_cases: HashMap<ast::ConfigurationId, TestCase>,
-    pub(super) template_strings: HashMap<ast::TemplateStringId, TemplateStringProperties>,
-}
+    pub(super) enum_attributes: HashMap<ast::TypeExpId, EnumAttributes>,
+    pub(super) class_attributes: HashMap<ast::TypeExpId, ClassAttributes>,
+    pub(super) class_dependencies: HashMap<ast::TypeExpId, HashSet<String>>,
+    pub(super) enum_dependencies: HashMap<ast::TypeExpId, HashSet<String>>,
 
-impl Types {
-    pub(super) fn refine_class_field(
-        &self,
-        (class_id, field_id): (ClassId, FieldId),
-    ) -> either::Either<StaticFieldId, DynamicFieldId> {
-        match self.class_attributes.get(&class_id) {
-            Some(attrs) => match attrs.field_serilizers.get(&field_id) {
-                Some(ToStringAttributes::Dynamic(_attrs)) => either::Either::Right(field_id.into()),
-                _ => either::Either::Left(field_id.into()),
-            },
-            None => either::Either::Left(field_id.into()),
-        }
-    }
+    /// Graph of type aliases.
+    ///
+    /// This graph is only used to detect infinite cycles in type aliases.
+    pub(crate) type_alias_dependencies: HashMap<ast::TypeAliasId, HashSet<ast::TypeAliasId>>,
 
-    pub(super) fn refine_enum_value(
-        &self,
-        (enum_id, value_id): (EnumId, EnumValueId),
-    ) -> either::Either<StaticFieldId, DynamicFieldId> {
-        match self.enum_attributes.get(&enum_id) {
-            Some(attrs) => match attrs.value_serilizers.get(&value_id) {
-                Some(ToStringAttributes::Dynamic(_attrs)) => either::Either::Right(value_id.into()),
-                _ => either::Either::Left(value_id.into()),
-            },
-            None => either::Either::Left(value_id.into()),
-        }
-    }
+    /// Fully resolved type aliases.
+    ///
+    /// A type alias con point to one or many other type aliases.
+    ///
+    /// ```ignore
+    /// type AliasOne = SomeClass
+    /// type AliasTwo = AnotherClass
+    /// type AliasThree = AliasTwo
+    /// type AliasFour = AliasOne | AliasTwo
+    /// ```
+    ///
+    /// In the above example, `AliasFour` would be resolved to the type
+    /// `SomeClass | AnotherClass`, which does not even exist in the AST. That's
+    /// why we need to store the resolution here.
+    ///
+    /// Contents would be `AliasThree -> SomeClass`.
+    pub(super) resolved_type_aliases: HashMap<ast::TypeAliasId, FieldType>,
 
-    #[allow(dead_code)]
-    pub(super) fn refine_serializer_field(
-        &self,
-        (variant_id, serializer_id, value_id): (
-            VariantConfigId,
-            VariantSerializerId,
-            SerializerFieldId,
-        ),
-    ) -> either::Either<StaticFieldId, DynamicFieldId> {
-        match self
-            .variant_attributes
-            .get(&variant_id)
-            .and_then(|r| r.serializers.get(&serializer_id))
-        {
-            Some(attrs) => match attrs.field_serilizers.get(&value_id) {
-                Some(ToStringAttributes::Dynamic(_)) => either::Either::Right(value_id.into()),
-                _ => either::Either::Left(value_id.into()),
-            },
-            None => either::Either::Left(value_id.into()),
-        }
-    }
+    /// Strongly connected components of the dependency graph.
+    ///
+    /// Basically contains all the different cycles. This allows us to find a
+    /// class in O(n) time and get all its recursive dependencies. Note that
+    /// infinite cycles are already discarded as errors at the validation
+    /// pipeline stage, so all cycles here have a termination point.
+    ///
+    /// TODO: There's probably some data structure other than [`Vec`] which can
+    /// get us a class with its dependencies faster than O(n), maybe a
+    /// Merge-Find Set or something like that.
+    pub(super) finite_recursive_cycles: Vec<Vec<ast::TypeExpId>>,
+
+    /// Contains recursive type aliases.
+    ///
+    /// Recursive type aliases are a little bit trickier than recursive classes
+    /// because the termination condition is tied to lists and maps only, which
+    /// introduce a level of indirection that can terminate a cycle:
+    ///
+    /// ```ignore
+    /// type A = A[]
+    /// type Map = map<string, Map>
+    /// ```
+    ///
+    /// The examples above are finite because an empty list or an empty map
+    /// stops the recursion. Nulls and unions won't allow type alias cycles to
+    /// be resolved so they don't count. This is implemented just like in
+    /// Typescript and we call it "structural recursion".
+    ///
+    /// However, due to how the parsing-validation pipeline is built, this
+    /// struct will temporarily store infinite cycles with no termination
+    /// condition until they are reported as an error during the cycle
+    /// validation. By the time we get to build the IR, this should only contain
+    /// valid "structural" cycles.
+    pub(super) recursive_alias_cycles: Vec<Vec<ast::TypeAliasId>>,
+
+    pub(super) function: HashMap<ast::ValExpId, FunctionType>,
+
+    pub(super) client_properties: HashMap<ast::ValExpId, ClientProperties>,
+    pub(super) retry_policies: HashMap<ast::ValExpId, RetryPolicy>,
+    pub(super) test_cases: HashMap<ast::ValExpId, TestCase>,
+    pub(super) template_strings:
+        HashMap<either::Either<ast::TemplateStringId, ast::ValExpId>, TemplateStringProperties>,
 }
 
 fn visit_template_string<'db>(
@@ -359,8 +336,16 @@ fn visit_template_string<'db>(
     ctx: &mut Context<'db>,
 ) {
     ctx.types.template_strings.insert(
-        idx,
+        either::Left(idx),
         TemplateStringProperties {
+            name: Some(template_string.name().to_string()),
+            type_dependencies: template_string
+                .input()
+                .map(|f| f.flat_idns())
+                .unwrap_or_default()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect::<HashSet<_>>(),
             template: template_string
                 .value()
                 .as_raw_string_value()
@@ -370,248 +355,439 @@ fn visit_template_string<'db>(
     );
 }
 
-fn visit_enum<'db>(_enm: &'db ast::Enum, _ctx: &mut Context<'db>) {}
-
-fn visit_class<'db>(class_id: ast::ClassId, class: &'db ast::Class, ctx: &mut Context<'db>) {
-    let used_types = class
-        .iter_fields()
-        .flat_map(|(_, f)| f.field_type.flat_idns())
-        .filter(|id| {
-            id.is_valid_type()
-                && match id {
-                    ast::Identifier::Primitive(..) => false,
-                    _ => true,
-                }
+fn visit_enum<'db>(
+    enm_id: ast::TypeExpId,
+    enm: &'db ast::TypeExpressionBlock,
+    ctx: &mut Context<'db>,
+) {
+    // Ensure that every value in the enum does not have an expression.
+    enm.fields
+        .iter()
+        .filter_map(|field| {
+            if field.expr.is_some() {
+                Some((field.span(), field.name()))
+            } else {
+                None
+            }
         })
-        .map(|f| f.name().to_string())
-        .collect::<HashSet<_>>();
-    ctx.types.class_dependencies.insert(class_id, used_types);
+        .for_each(|(span, field)| {
+            ctx.push_error(DatamodelError::new_validation_error(
+                format!("Unexpected type specified for value `{}`", field).as_str(),
+                span.clone(),
+            ));
+        });
+
+    let input_deps = enm.input().map(|f| f.flat_idns()).unwrap_or_default();
+    ctx.types.enum_dependencies.insert(
+        enm_id,
+        input_deps.iter().map(|id| id.name().to_string()).collect(),
+    );
 }
 
-fn visit_variant<'db>(idx: VariantConfigId, variant: &'db ast::Variant, ctx: &mut Context<'db>) {
-    if !variant.is_llm() {
-        ctx.push_error(DatamodelError::new_validation_error(
-            "Only LLM variants are supported. Use: impl<llm>",
-            variant.span().clone(),
-        ));
-        return;
-    }
+fn visit_class<'db>(
+    class_id: ast::TypeExpId,
+    class: &'db ast::TypeExpressionBlock,
+    ctx: &mut Context<'db>,
+) {
+    // Ensure that every value in the class is actually a name: type.
+    class
+        .fields
+        .iter()
+        .filter_map(|field| {
+            if field.expr.is_none() {
+                Some((field.span(), field.name()))
+            } else {
+                None
+            }
+        })
+        .for_each(|(span, field)| {
+            ctx.push_error(DatamodelError::new_validation_error(
+                format!("No type specified for field `{}`", field).as_str(),
+                span.clone(),
+            ));
+        });
 
-    let mut client = None;
-    let mut prompt = None;
-
-    variant
+    let mut used_types = class
         .iter_fields()
-        .for_each(|(_idx, field)| match field.name() {
-            "client" => {
-                if field.template_args.is_some() {
-                    ctx.push_error(DatamodelError::new_validation_error(
-                        "Did you mean `client` instead of `client<...>`?",
-                        field.span().clone(),
-                    ));
+        .flat_map(|(_, f)| f.expr.iter().flat_map(|e| e.flat_idns()))
+        .map(|id| id.name().to_string())
+        .collect::<HashSet<_>>();
+    let input_deps = class.input().map(|f| f.flat_idns()).unwrap_or_default();
+
+    ctx.types.class_dependencies.insert(class_id, {
+        used_types.extend(input_deps.iter().map(|id| id.name().to_string()));
+        used_types
+    });
+}
+
+/// Returns a "virtual" type that represents the fully resolved alias.
+///
+/// We call it "virtual" because it might not exist in the AST. Basic example:
+///
+/// ```ignore
+/// type AliasOne = SomeClass
+/// type AliasTwo = AnotherClass
+/// type AliasThree = AliasOne | AliasTwo | int
+/// ```
+///
+/// The type would resolve to `SomeClass | AnotherClass | int`, which is not
+/// stored in the AST.
+///
+/// **Important**: This function can only be called once infinite cycles have
+/// been detected! Otherwise it'll stack overflow.
+pub fn resolve_type_alias(field_type: &FieldType, ctx: &Context<'_>) -> Result<FieldType, String> {
+    Ok(match field_type {
+        // For symbols we need to check if we're dealing with aliases.
+        FieldType::Symbol(arity, ident, attrs) => {
+            let Some(string_id) = ctx.interner.lookup(ident.name()) else {
+                return Err(format!(
+                    "Attempting to resolve alias `{ident}` that does not exist in the interner"
+                ));
+            };
+
+            let Some(top_id) = ctx.names.tops.get(&string_id) else {
+                return Err(format!(
+                    "Alias name `{ident}` is not registered in the context"
+                ));
+            };
+
+            match top_id {
+                ast::TopId::TypeAlias(alias_id) => {
+                    let mut resolved = match ctx.types.resolved_type_aliases.get(alias_id) {
+                        // Check if we can avoid deeper recursion.
+                        Some(already_resolved) => already_resolved.to_owned(),
+
+                        // No luck, check if the type is resolvable.
+                        None => {
+                            // TODO: O(n)
+                            if ctx
+                                .types
+                                .recursive_alias_cycles
+                                .iter()
+                                .any(|cycle| cycle.contains(alias_id))
+                            {
+                                // Not resolvable, part of a cycle.
+                                field_type.to_owned()
+                            } else {
+                                // Maybe resolvable, recurse deeper.
+                                resolve_type_alias(&ctx.ast[*alias_id].value, ctx)?
+                            }
+                        }
+                    };
+
+                    // Sync arity. Basically stuff like:
+                    //
+                    // type AliasOne = SomeClass?
+                    // type AliasTwo = AliasOne
+                    //
+                    // AliasTwo resolves to an "optional" type.
+                    //
+                    // TODO: Add a `set_arity` function or something and avoid
+                    // this clone.
+                    resolved = if resolved.is_optional() || arity.is_optional() {
+                        resolved.to_nullable()
+                    } else {
+                        resolved
+                    };
+
+                    // Merge attributes.
+                    resolved.set_attributes({
+                        let mut merged_attrs = Vec::from(field_type.attributes());
+                        merged_attrs.extend(resolved.attributes().to_owned());
+
+                        merged_attrs
+                    });
+
+                    resolved
                 }
-                match field.value.as_ref() {
-                    Some(item) => client = Some((item, field.identifier().span().clone())),
-                    _ => {}
+
+                // Class or enum. Already "resolved", pop off the stack.
+                _ => field_type.to_owned(),
+            }
+        }
+
+        // Recurse and resolve each type individually.
+        FieldType::Union(arity, items, span, attrs)
+        | FieldType::Tuple(arity, items, span, attrs) => {
+            let resolved = items
+                .iter()
+                .map(|item| resolve_type_alias(item, ctx))
+                .collect::<Result<_, _>>()?;
+
+            match field_type {
+                FieldType::Union(..) => {
+                    FieldType::Union(*arity, resolved, span.clone(), attrs.clone())
+                }
+                FieldType::Tuple(..) => {
+                    FieldType::Tuple(*arity, resolved, span.clone(), attrs.clone())
+                }
+                _ => unreachable!("should only match tuples and unions"),
+            }
+        }
+
+        // Base case, primitives or other types that are not aliases. No more
+        // "pointers" and graphs here.
+        _ => field_type.to_owned(),
+    })
+}
+
+fn visit_type_alias<'db>(
+    alias_id: ast::TypeAliasId,
+    assignment: &'db ast::Assignment,
+    ctx: &mut Context<'db>,
+) {
+    // Insert the entry as soon as we get here then if we find something we'll
+    // add edges to the graph. Otherwise no edges but we still need the Vertex
+    // in order for the cycles algorithm to work.
+    let alias_refs = ctx
+        .types
+        .type_alias_dependencies
+        .entry(alias_id)
+        .or_default();
+
+    let mut stack = vec![&assignment.value];
+
+    while let Some(item) = stack.pop() {
+        match item {
+            FieldType::Symbol(_, ident, _) => {
+                let Some(string_id) = ctx.interner.lookup(ident.name()) else {
+                    ctx.push_error(DatamodelError::new_validation_error(
+                        &format!("Type alias points to unknown identifier `{ident}`"),
+                        item.span().clone(),
+                    ));
+                    return;
+                };
+
+                let Some(top_id) = ctx.names.tops.get(&string_id) else {
+                    ctx.push_error(DatamodelError::new_validation_error(
+                        &format!("Type alias points to unknown identifier `{ident}`"),
+                        item.span().clone(),
+                    ));
+                    return;
+                };
+
+                // Add alias to the graph.
+                if let ast::TopId::TypeAlias(nested_alias_id) = top_id {
+                    alias_refs.insert(*nested_alias_id);
                 }
             }
+
+            FieldType::Union(_, items, ..) | FieldType::Tuple(_, items, ..) => {
+                stack.extend(items.iter());
+            }
+
+            FieldType::List(_, nested, ..) => {
+                stack.push(nested);
+            }
+
+            FieldType::Map(_, nested, ..) => {
+                let (key, value) = nested.as_ref();
+                stack.push(key);
+                stack.push(value);
+            }
+
+            _ => {}
+        }
+    }
+}
+
+fn visit_function<'db>(idx: ValExpId, function: &'db ast::ValueExprBlock, ctx: &mut Context<'db>) {
+    let input_deps = function
+        .input()
+        .map(|input| input.flat_idns())
+        .unwrap_or_default()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect::<HashSet<_>>();
+
+    let output_deps = match function.output() {
+        Some(output) => output
+            .field_type
+            .flat_idns()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect::<HashSet<_>>(),
+        None => {
+            ctx.push_error(DatamodelError::new_invalid_function_syntax_error(
+                function.name(),
+                function.identifier().span().clone(),
+            ));
+            HashSet::new()
+        }
+    };
+
+    let mut prompt = None;
+    let mut client = None;
+    function
+        .iter_fields()
+        .for_each(|(_idx, field)| match field.name() {
             "prompt" => {
-                if field.template_args.is_some() {
-                    ctx.push_error(DatamodelError::new_validation_error(
-                        "Did you mean `prompt` instead of `prompt<...>`?",
-                        field.span().clone(),
-                    ));
+                prompt = match &field.expr {
+                    Some(val) => coerce::template_string(val, ctx.diagnostics),
+                    None => None,
                 }
-                match field.value.as_ref() {
-                    Some(item) => prompt = Some((item, field.identifier().span().clone())),
-                    _ => {}
+            }
+            "client" => {
+                client = match &field.expr {
+                    Some(val) => coerce::string_with_span(val, ctx.diagnostics)
+                        .map(|(v, span)| (v.to_string(), span.clone())),
+                    None => None,
                 }
             }
             config => ctx.push_error(DatamodelError::new_validation_error(
-                &format!("Unknown field `{}` in impl<llm>", config),
+                &format!("Unknown field `{}` in function", config),
                 field.span().clone(),
             )),
         });
 
-    let client = if let Some((client, client_key_span)) = client {
-        coerce::string_with_span(client, ctx.diagnostics).map(|client| (client, client_key_span))
-    } else {
-        ctx.push_error(DatamodelError::new_validation_error(
-            "Missing `client` field in impl<llm>",
-            variant.identifier().span().clone(),
-        ));
-        None
-    };
-
-    let prompt = if let Some((prompt, prompt_key_span)) = prompt {
-        if let Some(prompt) = prompt.as_raw_string_value() {
-            validate_prompt(ctx, prompt).map(|(cleaned_prompt, replacer)| {
-                ((cleaned_prompt, prompt.span(), replacer), prompt_key_span)
-            })
-        } else if let Some((prompt, span)) = coerce::string_with_span(prompt, ctx.diagnostics) {
-            // warn the user that we are using this without validation.
-            ctx.push_warning(DatamodelWarning::new(
-                "To use comments and {#vars} use a block string. #\"...\"# instead.".into(),
-                span.clone(),
-            ));
-            Some((
-                (prompt.to_string(), span, Default::default()),
-                prompt_key_span,
-            ))
-        } else {
-            // Errors are handled by coerce.
-            None
-        }
-    } else {
-        ctx.push_error(DatamodelError::new_validation_error(
-            "Missing `prompt` field in impl<llm>",
-            variant.identifier().span().clone(),
-        ));
-        None
-    };
-
-    // Ensure that the adapters are valid.
-    let (_input_adapter, output_adapter) =
-        variant
-            .iter_adapters()
-            .fold((None, None), |prev, (idx, adapter)| {
-                let is_input = match &adapter.from {
-                    FieldType::Identifier(arity, idn) if idn.name() == "input" => {
-                        if arity.is_optional() {
-                            ctx.push_error(DatamodelError::new_validation_error(
-                                "The `input` adapter cannot be optional.",
-                                idn.span().clone(),
-                            ));
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    _ => false,
-                };
-
-                let is_output = match &adapter.to {
-                    FieldType::Identifier(arity, idn) if idn.name() == "output" => {
-                        if arity.is_optional() {
-                            ctx.push_error(DatamodelError::new_validation_error(
-                                "The `output` adapter cannot be optional.",
-                                idn.span().clone(),
-                            ));
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    _ => false,
-                };
-
-                if is_input && is_output {
-                    ctx.push_error(DatamodelError::new_validation_error(
-                        "The `input` and `output` adapters cannot be used together.",
-                        adapter.span().clone(),
-                    ));
-                } else if is_input {
-                    if prev.0.is_some() {
-                        ctx.push_error(DatamodelError::new_validation_error(
-                            "The `input` adapter can only be used once.",
-                            adapter.span().clone(),
-                        ));
-                    } else {
-                        // Ensure the expr is either a string of array of strings.
-                        let impls = if let Some((arr, _)) = adapter.converter.as_array() {
-                            Some(
-                                arr.iter()
-                                    .filter_map(|item| coerce::raw_string(item, ctx.diagnostics))
-                                    .collect::<Vec<_>>(),
-                            )
-                        } else {
-                            coerce::raw_string(&adapter.converter, ctx.diagnostics)
-                                .map(|raw| vec![raw])
-                        };
-
-                        if let Some(impls) = impls {
-                            ctx.push_warning(DatamodelWarning::new(
-                                "The `input` adapter is note yet supported.".into(),
-                                adapter.span().clone(),
-                            ));
-                            return (Some((idx, impls)), prev.1);
-                        }
-                    }
-                } else if is_output {
-                    if prev.1.is_some() {
-                        ctx.push_error(DatamodelError::new_validation_error(
-                            "The `output` adapter can only be used once.",
-                            adapter.span().clone(),
-                        ));
-                    } else {
-                        let impls = if let Some((arr, _)) = adapter.converter.as_array() {
-                            Some(
-                                arr.iter()
-                                    .filter_map(|item| coerce::raw_string(item, ctx.diagnostics))
-                                    .cloned()
-                                    .collect::<Vec<_>>(),
-                            )
-                        } else {
-                            coerce::raw_string(&adapter.converter, ctx.diagnostics)
-                                .map(|raw| vec![raw.clone()])
-                        };
-
-                        if let Some(impls) = impls {
-                            return (prev.0, Some((idx, impls)));
-                        }
-                    }
-                } else {
-                    ctx.push_error(DatamodelError::new_validation_error(
-                        "The `input` or `output` adapter must be used.",
-                        adapter.span().clone(),
-                    ));
-                }
-                prev
-            });
-
-    match (client, prompt) {
-        (
-            Some(((client, client_span), client_key_span)),
-            Some(((prompt, prompt_span, replacers), prompt_key_span)),
-        ) => {
-            ctx.types.variant_properties.insert(
+    match (prompt, client) {
+        (Some(prompt), Some(client)) => {
+            ctx.types.function.insert(
                 idx,
-                VariantProperties {
-                    client: StringValue {
-                        value: client.to_string(),
-                        span: client_span.clone(),
-                        key_span: client_key_span,
-                    },
-                    prompt: StringValue {
-                        value: prompt.to_string(),
-                        span: prompt_span.clone(),
-                        key_span: prompt_key_span,
-                    },
-                    prompt_replacements: replacers,
-                    replacers: Default::default(),
-                    output_adapter,
+                FunctionType {
+                    dependencies: (input_deps.clone(), output_deps),
+                    prompt: Some(prompt.clone()),
+                    client: Some(client),
+                },
+            );
+
+            ctx.types.template_strings.insert(
+                either::Right(idx),
+                TemplateStringProperties {
+                    name: None,
+                    type_dependencies: input_deps,
+                    template: prompt.value().to_string(),
                 },
             );
         }
-        _ => {}
+        (Some(_), None) => {
+            ctx.push_error(DatamodelError::new_validation_error(
+                "Missing `client` field in function. Add to the block:\n```\nclient GPT4\n```",
+                function.identifier().span().clone(),
+            ));
+        }
+        (None, Some(_)) => {
+            ctx.push_error(DatamodelError::new_validation_error(
+                "Missing `prompt` field in function. Add to the block:\n```\nprompt #\"...\"#\n```",
+                function.identifier().span().clone(),
+            ));
+        }
+        (None, None) => {
+            ctx.push_error(DatamodelError::new_validation_error(
+                "Missing `prompt` and `client` fields in function. Add to the block:\n```\nclient GPT4\nprompt #\"...\"#\n```",
+                function.identifier().span().clone(),
+            ));
+        }
     }
 }
 
-fn visit_config<'db>(
-    idx: ConfigurationId,
-    config: &'db ast::Configuration,
-    ctx: &mut Context<'db>,
-) {
-    match config {
-        ast::Configuration::RetryPolicy(retry) => {
-            configurations::visit_retry_policy(idx, retry, ctx);
+fn visit_client<'db>(idx: ValExpId, client: &'db ast::ValueExprBlock, ctx: &mut Context<'db>) {
+    let mut provider = None;
+    let mut retry_policy = None;
+    let mut options = None;
+    client
+        .iter_fields()
+        .for_each(|(_idx, field)| match field.name() {
+            "provider" => {
+                match field
+                    .expr
+                    .as_ref()
+                    .and_then(|e| e.to_unresolved_value(ctx.diagnostics))
+                {
+                    Some(e) => match e.as_static_str() {
+                        Ok(s) => match s.parse::<ClientProvider>() {
+                            Ok(p) => provider = Some((p, e.meta().clone())),
+                            Err(err) => {
+                                ctx.push_error(DatamodelError::not_found_error(
+                                    "client provider",
+                                    s,
+                                    e.meta().clone(),
+                                    ClientProvider::allowed_providers()
+                                        .iter()
+                                        .map(|v| v.to_string())
+                                        .collect(),
+                                    false,
+                                ));
+                            }
+                        },
+                        Err(err) => ctx.push_error(DatamodelError::new_validation_error(
+                            &format!("`provider` value error: {err}"),
+                            e.meta().clone(),
+                        )),
+                    },
+                    None => ctx.push_error(DatamodelError::new_validation_error(
+                        "Missing `provider` field in client. e.g. `provider \"openai\"`",
+                        field.span().clone(),
+                    )),
+                }
+            }
+            "retry_policy" => retry_policy = field.expr.as_ref(),
+            "options" => {
+                match field
+                    .expr
+                    .as_ref()
+                    .and_then(|e| e.to_unresolved_value(ctx.diagnostics))
+                {
+                    Some(UnresolvedValue::Map(kv, _)) => {
+                        options = Some((kv, field.identifier().span().clone()));
+                    }
+                    Some(v) => {
+                        ctx.push_error(DatamodelError::new_validation_error(
+                            &format!("Expected a key-value pair, but got a: {}", v.r#type()),
+                            v.meta().clone(),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            config => ctx.push_error(DatamodelError::new_validation_error(
+                &format!("Unknown field `{}` in client", config),
+                field.span().clone(),
+            )),
+        });
+
+    let retry_policy = match retry_policy {
+        Some(retry_policy) => match coerce::string_with_span(retry_policy, ctx.diagnostics) {
+            Some((retry_policy, span)) => Some((retry_policy.to_string(), span.clone())),
+            _ => {
+                // Errors are handled by coerce.
+                None
+            }
+        },
+        None => None,
+    };
+
+    match provider {
+        Some(provider) => {
+            let (options_kv, options_span) = match options {
+                Some((kv, span)) => (kv, span),
+                None => (Default::default(), client.span().clone()),
+            };
+
+            let properties = PropertyHandler::new(options_kv, options_span);
+            // Parse and cache the result
+            match provider.0.parse_client_property(properties) {
+                Ok(options) => {
+                    ctx.types.client_properties.insert(
+                        idx,
+                        ClientProperties {
+                            provider,
+                            retry_policy,
+                            options,
+                        },
+                    );
+                }
+                Err(errors) => {
+                    for error in errors {
+                        ctx.push_error(DatamodelError::new_client_error(error.message, error.span));
+                    }
+                }
+            }
         }
-        ast::Configuration::Printer(printer) => {
-            configurations::visit_printer(idx, printer, ctx);
-        }
-        ast::Configuration::TestCase(test_case) => {
-            configurations::visit_test_case(idx, test_case, ctx);
-        }
+        None => ctx.push_error(DatamodelError::new_validation_error(
+            "Missing `provider` field in client. e.g. `provider openai`",
+            client.span().clone(),
+        )),
     }
 }
 
@@ -661,46 +837,12 @@ impl StaticType {
     }
 }
 
-/// An opaque identifier for a class field in a schema that is dynamic.
-#[derive(Copy, Clone, PartialEq, Debug, Hash, Eq, PartialOrd, Ord)]
-pub struct DynamicFieldId(u32);
-
-impl From<SerializerFieldId> for DynamicFieldId {
-    fn from(id: SerializerFieldId) -> Self {
-        DynamicFieldId(id.0)
-    }
-}
-
-impl From<FieldId> for DynamicFieldId {
-    fn from(id: FieldId) -> Self {
-        DynamicFieldId(id.0)
-    }
-}
-
-impl From<EnumValueId> for DynamicFieldId {
-    fn from(id: EnumValueId) -> Self {
-        DynamicFieldId(id.0)
-    }
-}
-
 /// An opaque identifier for a class field.
 #[derive(Copy, Clone, PartialEq, Debug, Eq, Hash)]
 pub struct StaticFieldId(u32);
 
-impl From<SerializerFieldId> for StaticFieldId {
-    fn from(id: SerializerFieldId) -> Self {
-        StaticFieldId(id.0)
-    }
-}
-
 impl From<FieldId> for StaticFieldId {
     fn from(id: FieldId) -> Self {
-        StaticFieldId(id.0)
-    }
-}
-
-impl From<EnumValueId> for StaticFieldId {
-    fn from(id: EnumValueId) -> Self {
         StaticFieldId(id.0)
     }
 }

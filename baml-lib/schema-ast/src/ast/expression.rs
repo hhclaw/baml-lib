@@ -1,23 +1,28 @@
-use baml_types::TypeValue;
+use baml_types::{TypeValue, UnresolvedValue as UnresolvedValueBase};
+use internal_baml_diagnostics::Diagnostics;
+
+type UnresolvedValue = UnresolvedValueBase<Span>;
 
 use crate::ast::Span;
+use bstd::dedent;
 use std::fmt;
 
 use super::{Identifier, WithName, WithSpan};
+use baml_types::JinjaExpression;
 
 #[derive(Debug, Clone)]
 pub struct RawString {
     raw_span: Span,
     #[allow(dead_code)]
-    raw_value: String,
-    inner_value: String,
+    pub raw_value: String,
+    pub inner_value: String,
 
     /// If set indicates the language of the raw string.
     /// By default it is a text string.
     pub language: Option<(String, Span)>,
 
     // This is useful for getting the final offset.
-    indent: usize,
+    pub indent: usize,
     inner_span_start: usize,
 }
 
@@ -27,74 +32,17 @@ impl WithSpan for RawString {
     }
 }
 
-pub fn dedent(s: &str) -> (String, usize) {
-    let mut prefix = "";
-    let mut lines = s.lines();
-
-    // We first search for a non-empty line to find a prefix.
-    for line in &mut lines {
-        let mut whitespace_idx = line.len();
-        for (idx, ch) in line.char_indices() {
-            if !ch.is_whitespace() {
-                whitespace_idx = idx;
-                break;
-            }
-        }
-
-        // Check if the line had anything but whitespace
-        if whitespace_idx < line.len() {
-            prefix = &line[..whitespace_idx];
-            break;
-        }
-    }
-
-    // We then continue looking through the remaining lines to
-    // possibly shorten the prefix.
-    for line in &mut lines {
-        let mut whitespace_idx = line.len();
-        for ((idx, a), b) in line.char_indices().zip(prefix.chars()) {
-            if a != b {
-                whitespace_idx = idx;
-                break;
-            }
-        }
-
-        // Check if the line had anything but whitespace and if we
-        // have found a shorter prefix
-        if whitespace_idx < line.len() && whitespace_idx < prefix.len() {
-            prefix = &line[..whitespace_idx];
-        }
-    }
-
-    // We now go over the lines a second time to build the result.
-    let mut result = String::new();
-    for line in s.lines() {
-        if line.starts_with(prefix) && line.chars().any(|c| !c.is_whitespace()) {
-            let (_, tail) = line.split_at(prefix.len());
-            result.push_str(tail);
-        }
-        result.push('\n');
-    }
-
-    if result.ends_with('\n') && !s.ends_with('\n') {
-        let new_len = result.len() - 1;
-        result.truncate(new_len);
-    }
-
-    (result, prefix.len())
-}
-
 impl RawString {
     pub(crate) fn new(value: String, span: Span, language: Option<(String, Span)>) -> Self {
-        let dedented_value = value.trim_start_matches(|c| c == '\n' || c == '\r');
+        let dedented_value = value.trim_start_matches(['\n', '\r']);
         let start_trim_count = value.len() - dedented_value.len();
         let dedented_value = dedented_value.trim_end();
-        let (dedented_value, indent_size) = dedent(dedented_value);
+        let dedented = dedent(dedented_value);
         Self {
             raw_span: span,
             raw_value: value,
-            inner_value: dedented_value,
-            indent: indent_size,
+            inner_value: dedented.content,
+            indent: dedented.indent_size,
             inner_span_start: start_trim_count,
             language,
         }
@@ -133,6 +81,13 @@ impl RawString {
                 + span.end(),
         }
     }
+
+    pub fn assert_eq_up_to_span(&self, other: &RawString) {
+        assert_eq!(self.inner_value, other.inner_value);
+        assert_eq!(self.raw_value, other.raw_value);
+        assert_eq!(self.language, other.language);
+        assert_eq!(self.indent, other.indent);
+    }
 }
 
 /// Represents arbitrary, even nested, expressions.
@@ -152,14 +107,45 @@ pub enum Expression {
     Array(Vec<Expression>, Span),
     /// A mapping function.
     Map(Vec<(Expression, Expression)>, Span),
+    /// A JinjaExpression. e.g. "this|length > 5".
+    JinjaExpressionValue(JinjaExpression, Span),
+}
+
+impl fmt::Display for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expression::Identifier(id) => fmt::Display::fmt(id.name(), f),
+            Expression::BoolValue(val, _) => fmt::Display::fmt(val, f),
+            Expression::NumericValue(val, _) => fmt::Display::fmt(val, f),
+            Expression::StringValue(val, _) => write!(f, "{}", crate::string_literal(val)),
+            Expression::RawStringValue(val, ..) => {
+                write!(f, "{}", crate::string_literal(val.value()))
+            }
+            Expression::JinjaExpressionValue(val, ..) => fmt::Display::fmt(val, f),
+            Expression::Array(vals, _) => {
+                let vals = vals
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write!(f, "[{vals}]")
+            }
+            Expression::Map(vals, _) => {
+                let vals = vals
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write!(f, "{{{vals}}}")
+            }
+        }
+    }
 }
 
 impl Expression {
     pub fn from_json(value: serde_json::Value, span: Span, empty_span: Span) -> Expression {
         match value {
-            serde_json::Value::Null => {
-                Expression::Identifier(Identifier::Primitive(TypeValue::Null, span))
-            }
+            serde_json::Value::Null => Expression::StringValue("Null".to_string(), empty_span),
             serde_json::Value::Bool(b) => Expression::BoolValue(b, span),
             serde_json::Value::Number(n) => Expression::NumericValue(n.to_string(), span),
             serde_json::Value::String(s) => Expression::StringValue(s, span),
@@ -184,39 +170,6 @@ impl Expression {
             }
         }
     }
-}
-
-impl fmt::Display for Expression {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Expression::Identifier(id) => fmt::Display::fmt(id.name(), f),
-            Expression::BoolValue(val, _) => fmt::Display::fmt(val, f),
-            Expression::NumericValue(val, _) => fmt::Display::fmt(val, f),
-            Expression::StringValue(val, _) => write!(f, "{}", crate::string_literal(val)),
-            Expression::RawStringValue(val, ..) => {
-                write!(f, "{}", crate::string_literal(val.value()))
-            }
-            Expression::Array(vals, _) => {
-                let vals = vals
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                write!(f, "[{vals}]")
-            }
-            Expression::Map(vals, _) => {
-                let vals = vals
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                write!(f, "{{{vals}}}")
-            }
-        }
-    }
-}
-
-impl Expression {
     pub fn as_array(&self) -> Option<(&[Expression], &Span)> {
         match self {
             Expression::Array(arr, span) => Some((arr, span)),
@@ -290,6 +243,7 @@ impl Expression {
             Self::NumericValue(_, span) => span,
             Self::StringValue(_, span) => span,
             Self::RawStringValue(r) => r.span(),
+            Self::JinjaExpressionValue(_, span) => span,
             Self::Identifier(id) => id.span(),
             Self::Map(_, span) => span,
             Self::Array(_, span) => span,
@@ -307,12 +261,12 @@ impl Expression {
             Expression::NumericValue(_, _) => "numeric",
             Expression::StringValue(_, _) => "string",
             Expression::RawStringValue(_) => "raw_string",
+            Expression::JinjaExpressionValue(_, _) => "jinja_expression",
             Expression::Identifier(id) => match id {
                 Identifier::String(_, _) => "string",
                 Identifier::Local(_, _) => "local_type",
                 Identifier::Ref(_, _) => "ref_type",
                 Identifier::ENV(_, _) => "env_type",
-                Identifier::Primitive(_, _) => "primitive_type",
                 Identifier::Invalid(_, _) => "invalid_type",
             },
             Expression::Map(_, _) => "map",
@@ -337,5 +291,115 @@ impl Expression {
                 | Expression::Identifier(Identifier::Invalid(_, _))
                 | Expression::Identifier(Identifier::Local(_, _))
         )
+    }
+
+    pub fn assert_eq_up_to_span(&self, other: &Expression) {
+        use Expression::*;
+        match (self, other) {
+            (BoolValue(v1, _), BoolValue(v2, _)) => assert_eq!(v1, v2),
+            (BoolValue(_, _), _) => panic!("Types do not match: {self:?} and {other:?}"),
+            (NumericValue(n1, _), NumericValue(n2, _)) => assert_eq!(n1, n2),
+            (NumericValue(_, _), _) => panic!("Types do not match: {self:?} and {other:?}"),
+            (Identifier(i1), Identifier(i2)) => assert_eq!(i1, i2),
+            (Identifier(_), _) => panic!("Types do not match: {self:?} and {other:?}"),
+            (StringValue(s1, _), StringValue(s2, _)) => assert_eq!(s1, s2),
+            (StringValue(_, _), _) => panic!("Types do not match: {self:?} and {other:?}"),
+            (RawStringValue(s1), RawStringValue(s2)) => s1.assert_eq_up_to_span(s2),
+            (RawStringValue(_), _) => panic!("Types do not match: {self:?} and {other:?}"),
+            (JinjaExpressionValue(j1, _), JinjaExpressionValue(j2, _)) => assert_eq!(j1, j2),
+            (JinjaExpressionValue(_, _), _) => {
+                panic!("Types do not match: {self:?} and {other:?}")
+            }
+            (Array(xs, _), Array(ys, _)) => {
+                assert_eq!(xs.len(), ys.len());
+                xs.iter().zip(ys).for_each(|(x, y)| {
+                    x.assert_eq_up_to_span(y);
+                })
+            }
+            (Array(_, _), _) => panic!("Types do not match: {self:?} and {other:?}"),
+            (Map(m1, _), Map(m2, _)) => {
+                assert_eq!(m1.len(), m2.len());
+                m1.iter().zip(m2).for_each(|((k1, v1), (k2, v2))| {
+                    k1.assert_eq_up_to_span(k2);
+                    v1.assert_eq_up_to_span(v2);
+                });
+            }
+            (Map(_, _), _) => panic!("Types do not match: {self:?} and {other:?}"),
+        }
+    }
+
+    pub fn to_unresolved_value(
+        &self,
+        _diagnostics: &mut internal_baml_diagnostics::Diagnostics,
+    ) -> Option<UnresolvedValue> {
+        use baml_types::StringOr;
+
+        match self {
+            Expression::BoolValue(val, span) => Some(UnresolvedValue::Bool(*val, span.clone())),
+            Expression::NumericValue(val, span) => {
+                Some(UnresolvedValue::Numeric(val.clone(), span.clone()))
+            }
+            Expression::Identifier(identifier) => match identifier {
+                Identifier::ENV(val, span) => Some(UnresolvedValue::String(
+                    StringOr::EnvVar(val.to_string()),
+                    span.clone(),
+                )),
+                Identifier::Ref(ref_identifier, span) => Some(UnresolvedValue::String(
+                    StringOr::Value(ref_identifier.full_name.as_str().to_string()),
+                    span.clone(),
+                )),
+                Identifier::Invalid(val, span)
+                | Identifier::String(val, span)
+                | Identifier::Local(val, span) => match val.as_str() {
+                    "null" => Some(UnresolvedValue::Null(span.clone())),
+                    "true" => Some(UnresolvedValue::Bool(true, span.clone())),
+                    "false" => Some(UnresolvedValue::Bool(false, span.clone())),
+                    _ => Some(UnresolvedValue::String(
+                        StringOr::Value(val.to_string()),
+                        span.clone(),
+                    )),
+                },
+            },
+            Expression::StringValue(val, span) => Some(UnresolvedValue::String(
+                StringOr::Value(val.to_string()),
+                span.clone(),
+            )),
+            Expression::RawStringValue(raw_string) => {
+                // Do standard dedenting / trimming.
+                let val = raw_string.value();
+                Some(UnresolvedValue::String(
+                    StringOr::Value(val.to_string()),
+                    raw_string.span().clone(),
+                ))
+            }
+            Expression::Array(vec, span) => {
+                let values = vec
+                    .iter()
+                    .filter_map(|e| e.to_unresolved_value(_diagnostics))
+                    .collect::<Vec<_>>();
+                Some(UnresolvedValue::Array(values, span.clone()))
+            }
+            Expression::Map(map, span) => {
+                let values = map
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let key = k.to_unresolved_value(_diagnostics);
+                        if let Some(UnresolvedValue::String(StringOr::Value(key), key_span)) = key {
+                            if let Some(value) = v.to_unresolved_value(_diagnostics) {
+                                return Some((key, (key_span, value)));
+                            }
+                        }
+                        None
+                    })
+                    .collect::<_>();
+                Some(UnresolvedValue::Map(values, span.clone()))
+            }
+            Expression::JinjaExpressionValue(jinja_expression, span) => {
+                Some(UnresolvedValue::String(
+                    StringOr::JinjaExpression(jinja_expression.clone()),
+                    span.clone(),
+                ))
+            }
+        }
     }
 }

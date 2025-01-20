@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use super::DatamodelError;
 use crate::{warning::DatamodelWarning, SourceFile, Span};
@@ -9,6 +9,7 @@ use crate::{warning::DatamodelWarning, SourceFile, Span};
 /// It is used to not error out early and instead show multiple errors at once.
 #[derive(Debug, Default, Clone)]
 pub struct Diagnostics {
+    pub root_path: PathBuf,
     current_file: Option<SourceFile>,
     errors: Vec<DatamodelError>,
     warnings: Vec<DatamodelWarning>,
@@ -20,10 +21,10 @@ impl std::fmt::Display for Diagnostics {
         let warn_str = self.warnings_to_pretty_string();
 
         if !err_str.is_empty() {
-            writeln!(f, "{}", err_str)?;
+            writeln!(f, "{err_str}")?;
         }
         if !warn_str.is_empty() {
-            writeln!(f, "{}", warn_str)?;
+            writeln!(f, "{warn_str}")?;
         }
 
         Ok(())
@@ -33,8 +34,9 @@ impl std::fmt::Display for Diagnostics {
 impl std::error::Error for Diagnostics {}
 
 impl Diagnostics {
-    pub fn new() -> Diagnostics {
+    pub fn new(root_path: PathBuf) -> Diagnostics {
         Diagnostics {
+            root_path,
             current_file: None,
             errors: Vec::new(),
             warnings: Vec::new(),

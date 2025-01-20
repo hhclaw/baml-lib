@@ -1,5 +1,8 @@
-use internal_baml_jinja::{PredefinedTypes, Type};
-use internal_baml_schema_ast::ast::{self, FunctionArgs, Span, WithIdentifier, WithName, WithSpan};
+use either::Either;
+use internal_baml_jinja_types::{PredefinedTypes, Type};
+use internal_baml_schema_ast::ast::{
+    self, ArgumentId, BlockArgs, Span, WithIdentifier, WithName, WithSpan,
+};
 
 use crate::types::TemplateStringProperties;
 
@@ -15,7 +18,7 @@ impl<'db> TemplateStringWalker<'db> {
     }
 
     fn metadata(self) -> &'db TemplateStringProperties {
-        &self.db.types.template_strings[&self.id]
+        &self.db.types.template_strings[&Either::Left(self.id)]
     }
 
     /// The value of the template string.
@@ -28,13 +31,30 @@ impl<'db> TemplateStringWalker<'db> {
         &self.metadata().template
     }
 
+    /// Walk the input arguments of the template string.
+    pub fn walk_input_args(self) -> impl ExactSizeIterator<Item = ArgWalker<'db>> {
+        match self.ast_node().input() {
+            Some(input) => {
+                let range_end = input.iter_args().len() as u32;
+                (0..range_end)
+                    .map(move |f| ArgWalker {
+                        db: self.db,
+                        id: (self.id, ArgumentId(f)),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            }
+            None => Vec::new().into_iter(),
+        }
+    }
+
     /// The name of the template string.
     pub fn add_to_types(self, types: &mut PredefinedTypes) {
         let name = self.name();
         let ret_type = Type::String;
         let mut params = vec![];
 
-        if let Some(FunctionArgs::Named(p)) = self.ast_node().input() {
+        if let Some(p) = self.ast_node().input() {
             p.args.iter().for_each(|(name, t)| {
                 params.push((
                     name.name().to_string(),
@@ -56,5 +76,36 @@ impl WithIdentifier for TemplateStringWalker<'_> {
 impl<'a> WithSpan for TemplateStringWalker<'a> {
     fn span(&self) -> &Span {
         self.ast_node().span()
+    }
+}
+
+pub type ArgWalker<'db> = super::Walker<'db, (ast::TemplateStringId, ArgumentId)>;
+
+impl<'db> ArgWalker<'db> {
+    /// The ID of the function in the db
+    pub fn block_id(self) -> ast::TemplateStringId {
+        self.id.0
+    }
+
+    /// The AST node.
+    pub fn ast_type_block(self) -> &'db ast::TemplateString {
+        &self.db.ast[self.id.0]
+    }
+
+    /// The AST node.
+    pub fn ast_arg(self) -> (Option<&'db ast::Identifier>, &'db ast::BlockArg) {
+        let args = self.ast_type_block().input();
+        let res: &_ = &args.expect("Expected input args")[self.id.1];
+        (Some(&res.0), &res.1)
+    }
+
+    /// The name of the type.
+    pub fn field_type(self) -> &'db ast::FieldType {
+        &self.ast_arg().1.field_type
+    }
+
+    /// The name of the function.
+    pub fn is_optional(self) -> bool {
+        self.field_type().is_optional()
     }
 }

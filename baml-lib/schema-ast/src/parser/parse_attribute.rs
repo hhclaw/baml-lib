@@ -1,3 +1,6 @@
+use baml_types::ConstraintLevel;
+use internal_baml_diagnostics::DatamodelError;
+
 use super::{
     helpers::{parsing_catch_all, Pair},
     parse_identifier::parse_identifier,
@@ -7,6 +10,7 @@ use crate::{assert_correct_parser, ast::*, parser::parse_arguments::parse_argume
 
 pub(crate) fn parse_attribute(
     pair: Pair<'_>,
+    parenthesized: bool,
     diagnostics: &mut internal_baml_diagnostics::Diagnostics,
 ) -> Attribute {
     assert_correct_parser!(pair, Rule::block_attribute, Rule::field_attribute);
@@ -21,7 +25,7 @@ pub(crate) fn parse_attribute(
             Rule::arguments_list => {
                 parse_arguments_list(current, &mut arguments, &name, diagnostics)
             }
-            _ => parsing_catch_all(&current, "attribute"),
+            _ => parsing_catch_all(current, "attribute"),
         }
     }
 
@@ -29,8 +33,10 @@ pub(crate) fn parse_attribute(
         Some(name) => Attribute {
             name,
             arguments,
+            parenthesized,
             span,
         },
+        // This is suspicious, can probably cause a panic
         None => unreachable!("Name should always be defined for attribute."),
     }
 }

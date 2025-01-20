@@ -1,3 +1,5 @@
+mod iterative_parser;
+
 mod parser;
 // #[cfg(test)]
 // mod test_iterative_parser;

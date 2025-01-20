@@ -6,9 +6,11 @@ create_exception!(baml_lib, BamlLibError, pyo3::exceptions::PyException);
 
 impl BamlLibError {
     fn from_anyhow(err: anyhow::Error) -> PyErr {
-        PyErr::new::<BamlLibError, _>(format!("{:?}", err))
+        let backtrace = err.backtrace();
+        PyErr::new::<BamlLibError, _>(format!("{}: {:?}", err, backtrace))
     }
 }
+
 
 #[pyo3::pyfunction]
 #[pyo3(signature = (schema_string, target_name=None, prefix=None, always_hoist_enums=None))]

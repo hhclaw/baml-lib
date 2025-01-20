@@ -1,4 +1,17 @@
-use crate::{BamlImage, BamlValue};
+use crate::{BamlMedia, BamlValue};
+use std::fmt;
+
+/// A wrapper around a jinja expression. The inner `String` should not contain
+/// the interpolation brackets `{{ }}`; it should be a bare expression like
+/// `"this|length < something"`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Hash, Eq)]
+pub struct JinjaExpression(pub String);
+
+impl fmt::Display for JinjaExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 impl From<BamlValue> for minijinja::Value {
     fn from(arg: BamlValue) -> minijinja::Value {
@@ -15,7 +28,7 @@ impl From<BamlValue> for minijinja::Value {
                 let list: Vec<minijinja::Value> = l.into_iter().map(|v| v.into()).collect();
                 minijinja::Value::from(list)
             }
-            BamlValue::Image(i) => i.into(),
+            BamlValue::Media(i) => i.into(),
             BamlValue::Enum(_, v) => minijinja::Value::from(v),
             BamlValue::Class(_, m) => {
                 let map = m.into_iter().map(|(k, v)| (k, minijinja::Value::from(v)));
@@ -26,36 +39,43 @@ impl From<BamlValue> for minijinja::Value {
     }
 }
 
-#[derive(Debug)]
-struct MinijinjaBamlImage {
-    image: BamlImage,
+struct MinijinjaBamlMedia {
+    media: BamlMedia,
 }
 
-impl From<BamlImage> for MinijinjaBamlImage {
-    fn from(image: BamlImage) -> MinijinjaBamlImage {
-        MinijinjaBamlImage { image }
+impl From<BamlMedia> for MinijinjaBamlMedia {
+    fn from(media: BamlMedia) -> MinijinjaBamlMedia {
+        MinijinjaBamlMedia { media }
     }
 }
 
-impl From<BamlImage> for minijinja::Value {
-    fn from(arg: BamlImage) -> minijinja::Value {
-        minijinja::Value::from_object(MinijinjaBamlImage::from(arg))
+impl From<BamlMedia> for minijinja::Value {
+    fn from(arg: BamlMedia) -> minijinja::Value {
+        minijinja::Value::from_object(MinijinjaBamlMedia::from(arg))
     }
 }
 
-const MAGIC_IMAGE_DELIMITER: &'static str = "BAML_IMAGE_MAGIC_STRING_DELIMITER";
+const MAGIC_MEDIA_DELIMITER: &str = "BAML_MEDIA_MAGIC_STRING_DELIMITER";
 
-impl std::fmt::Display for MinijinjaBamlImage {
+impl std::fmt::Display for MinijinjaBamlMedia {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{MAGIC_IMAGE_DELIMITER}:baml-start-image:{}:baml-end-image:{MAGIC_IMAGE_DELIMITER}",
-            serde_json::json!(self.image)
+            "{MAGIC_MEDIA_DELIMITER}:baml-start-media:{}:baml-end-media:{MAGIC_MEDIA_DELIMITER}",
+            serde_json::json!(self.media)
         )
     }
 }
 
-impl minijinja::value::Object for MinijinjaBamlImage {
+// Necessary for nested instances of MinijinjaBamlImage to get rendered correctly in prompts
+// See https://github.com/BoundaryML/baml/pull/855 for explanation
+impl std::fmt::Debug for MinijinjaBamlMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl minijinja::value::Object for MinijinjaBamlMedia {
     fn call(
         &self,
         _state: &minijinja::State<'_, '_>,
@@ -63,7 +83,7 @@ impl minijinja::value::Object for MinijinjaBamlImage {
     ) -> Result<minijinja::value::Value, minijinja::Error> {
         Err(minijinja::Error::new(
             minijinja::ErrorKind::UnknownMethod,
-            format!("BamlImage has no callable attribute '{:#?}'", args),
+            format!("BamlImage has no callable attribute '{args:#?}'"),
         ))
     }
 }

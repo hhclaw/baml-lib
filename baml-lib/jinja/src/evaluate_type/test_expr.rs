@@ -1,8 +1,10 @@
+use baml_types::LiteralValue;
 use minijinja::machinery::parse_expr;
 
 use crate::evaluate_type::{
     expr::evaluate_type,
     types::{PredefinedTypes, Type},
+    JinjaContext,
 };
 
 macro_rules! assert_evaluates_to {
@@ -44,19 +46,19 @@ macro_rules! assert_fails_to {
 
 #[test]
 fn test_evaluate_number() {
-    let types = PredefinedTypes::default();
+    let types = PredefinedTypes::default(JinjaContext::Prompt);
     assert_eq!(assert_evaluates_to!("1.1 + 1", &types), Type::Number);
 }
 
 #[test]
 fn test_evaluate_bool() {
-    let types = PredefinedTypes::default();
+    let types = PredefinedTypes::default(JinjaContext::Prompt);
     assert_eq!(assert_evaluates_to!("not 1.1", &types), Type::Bool);
 }
 
 #[test]
 fn test_evaluate_string() {
-    let mut types = PredefinedTypes::default();
+    let mut types = PredefinedTypes::default(JinjaContext::Prompt);
     assert_eq!(
         assert_fails_to!("ok ~ 1.1", &types),
         vec!["Variable `ok` does not exist. Did you mean one of these: `_`, `ctx`?"]
@@ -67,7 +69,7 @@ fn test_evaluate_string() {
 
 #[test]
 fn test_evaluate_setting() {
-    let mut types = PredefinedTypes::default();
+    let mut types = PredefinedTypes::default(JinjaContext::Prompt);
     assert_eq!(
         assert_fails_to!("bar.f.g", &types),
         vec!["Variable `bar` does not exist. Did you mean one of these: `_`, `ctx`?"]
@@ -89,15 +91,29 @@ fn test_evaluate_setting() {
 
 #[test]
 fn test_ifexpr() {
-    let mut types = PredefinedTypes::default();
+    let mut types = PredefinedTypes::default(JinjaContext::Prompt);
     assert_eq!(
         assert_evaluates_to!("1 if true else 2", &types),
-        Type::Number
+        Type::Union(vec![
+            Type::Literal(LiteralValue::Int(1)),
+            Type::Literal(LiteralValue::Int(2))
+        ])
     );
 
     assert_eq!(
         assert_evaluates_to!("1 if true else '2'", &types),
-        Type::Union(vec![Type::Number, Type::String])
+        Type::Union(vec![
+            Type::Literal(LiteralValue::String("2".to_string())),
+            Type::Literal(LiteralValue::Int(1))
+        ])
+    );
+
+    assert_eq!(
+        assert_evaluates_to!("'1' if true else 2", &types),
+        Type::Union(vec![
+            Type::Literal(LiteralValue::String("1".to_string())),
+            Type::Literal(LiteralValue::Int(2))
+        ])
     );
 
     types.add_function("AnotherFunc", Type::Float, vec![("arg".into(), Type::Bool)]);
@@ -111,7 +127,7 @@ fn test_ifexpr() {
 
 #[test]
 fn test_eval() {
-    let types = PredefinedTypes::default();
+    let types = PredefinedTypes::default(JinjaContext::Prompt);
     assert_eq!(assert_evaluates_to!("1 + 1", &types), Type::Number);
     assert_eq!(assert_evaluates_to!("1 - 1", &types), Type::Number);
     assert_eq!(assert_evaluates_to!("1 * 1", &types), Type::Number);
@@ -131,13 +147,13 @@ fn test_eval() {
 
 #[test]
 fn test_call_function() {
-    let mut types = PredefinedTypes::default();
+    let mut types = PredefinedTypes::default(JinjaContext::Prompt);
     types.add_function("SomeFunc", Type::Float, vec![("arg".into(), Type::Bool)]);
 
     assert_eq!(assert_evaluates_to!("SomeFunc(true)", &types), Type::Float);
     assert_eq!(
         assert_fails_to!("SomeFunc(arg=1)", &types),
-        vec!["Function 'SomeFunc' expects argument 'arg' to be of type bool, but got number"]
+        vec!["Function 'SomeFunc' expects argument 'arg' to be of type bool, but got literal[1]"]
     );
 
     types.add_function(
@@ -152,14 +168,16 @@ fn test_call_function() {
 
     assert_eq!(
         assert_fails_to!("AnotherFunc(arg='true', arg2='1')", &types),
-        vec!["Function 'AnotherFunc' expects argument 'arg' to be of type bool, but got string"]
+        vec![
+            r#"Function 'AnotherFunc' expects argument 'arg' to be of type bool, but got literal["true"]"#
+        ]
     );
 
     assert_eq!(
         assert_fails_to!("AnotherFunc(arg=SomeFunc(true) ~ 1, arg2=1)", &types),
         vec![
             "Function 'AnotherFunc' expects argument 'arg' to be of type bool, but got string",
-            "Function 'AnotherFunc' expects argument 'arg2' to be of type string, but got number"
+            "Function 'AnotherFunc' expects argument 'arg2' to be of type string, but got literal[1]"
         ]
     );
 
@@ -192,7 +210,88 @@ fn test_call_function() {
         assert_fails_to!("AnotherFunc(true, arg2='1', arg4=1)", &types),
         vec![
             "Function 'AnotherFunc' expects argument 'arg3'",
-            "Function 'AnotherFunc' does not have an argument 'arg4'"
+            "Function 'AnotherFunc' does not have an argument 'arg4'. Did you mean 'arg3'?"
         ]
+    );
+
+    types.add_function(
+        "TakesLiteralFoo",
+        Type::Float,
+        vec![(
+            "arg".to_string(),
+            Type::Union(vec![
+                Type::Literal(LiteralValue::String("Foo".to_string())),
+                Type::Literal(LiteralValue::String("Bar".to_string())),
+            ]),
+        )],
+    );
+
+    assert_eq!(
+        assert_evaluates_to!("TakesLiteralFoo('Foo')", &types),
+        Type::Float
+    );
+}
+
+#[test]
+fn test_output_format() {
+    let types = PredefinedTypes::default(JinjaContext::Prompt);
+    assert_eq!(
+        assert_evaluates_to!("ctx.output_format(prefix='hi')", &types),
+        Type::String
+    );
+
+    assert_eq!(
+        assert_evaluates_to!("ctx.output_format(prefix='1', or_splitter='1')", &types),
+        Type::String
+    );
+
+    assert_eq!(
+        assert_evaluates_to!(
+            "ctx.output_format(prefix='1', enum_value_prefix=none)",
+            &types
+        ),
+        Type::String
+    );
+
+    assert_eq!(
+        assert_fails_to!(
+            "ctx.output_format(prefix='1', always_hoist_enums=1)",
+            &types
+        ),
+        vec!["Function 'baml::OutputFormat' expects argument 'always_hoist_enums' to be of type (none | bool), but got literal[1]"]
+    );
+
+    assert_eq!(
+        assert_fails_to!(
+            "ctx.output_format(prefix='1', hoisted_class_prefix=1)",
+            &types
+        ),
+        vec!["Function 'baml::OutputFormat' expects argument 'hoisted_class_prefix' to be of type (none | string), but got literal[1]"]
+    );
+
+    assert_eq!(
+        assert_fails_to!("ctx.output_format(prefix='1', unknown=1)", &types),
+        vec!["Function 'baml::OutputFormat' does not have an argument 'unknown'. Did you mean one of these: 'always_hoist_enums', 'enum_value_prefix', 'or_splitter'?"]
+    );
+}
+
+#[test]
+fn sum_filter() {
+    let types = PredefinedTypes::default(JinjaContext::Prompt);
+    assert_eq!(assert_evaluates_to!(r#"[1,2,3]|sum"#, types), Type::Int);
+    assert_eq!(
+        assert_evaluates_to!(r#"[1.1,2.1,3.2]|sum"#, types),
+        Type::Float
+    );
+    // // This would be nice, but it doesn't work.
+    // // Type checker says this is a subtype of `int[]`.
+    // // BUG.
+    // assert_eq!(
+    //     assert_evaluates_to!(r#"[1.1,2,3]|sum"#, types),
+    //     Type::Float
+    // );
+    assert_eq!(
+        assert_fails_to!(r#"["hi", 1]|sum"#, types),
+        vec![r#"'[hi,1]' is a list[(literal["hi"] | literal[1])], expected (int|float)[]"#]
     );
 }

@@ -20,12 +20,12 @@ pub(super) fn coerce_union(
 
     let options = match union_target {
         FieldType::Union(options) => options,
-        _ => unreachable!(),
+        _ => unreachable!("coerce_union"),
     };
 
     let parsed = options
         .iter()
-        .map(|option| option.coerce(ctx, union_target, value))
+        .map(|option| option.coerce(ctx, option, value))
         .collect::<Vec<_>>();
 
     array_helper::pick_best(ctx, union_target, &parsed)

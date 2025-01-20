@@ -1,6 +1,11 @@
 use core::panic;
-use std::{collections::HashMap, ops::BitOr};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::BitOr,
+    vec,
+};
 
+use baml_types::LiteralValue;
 use minijinja::machinery::{
     ast::{Call, Spanned},
     Span,
@@ -8,7 +13,7 @@ use minijinja::machinery::{
 
 use super::TypeError;
 
-#[derive(Debug, Clone, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Unknown,
     Undefined,
@@ -19,36 +24,122 @@ pub enum Type {
     Number,
     String,
     Bool,
+    Literal(LiteralValue),
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Tuple(Vec<Type>),
     Union(Vec<Type>),
+    // It is simultaneously two types, whichever fits best
+    Both(Box<Type>, Box<Type>),
     ClassRef(String),
     FunctionRef(String),
+    /// TODO: This should be `AliasRef(String)` but functions like
+    /// [`Self::is_subtype_of`] or [`Self::bitor`] don't have access to the
+    /// [`PredefinedTypes`] instance, so we can't grab type resolutions from
+    /// there.
+    ///
+    /// We'll just store all the necessary information in the type itself for
+    /// now.
+    Alias {
+        name: String,
+        target: Box<Type>,
+        resolved: Box<Type>,
+    },
+    /// TODO: This one could store the target so that we can report what it
+    /// points to instead of just the name.
+    RecursiveTypeAlias(String),
     Image,
+    Audio,
 }
-
-impl PartialEq for Type {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Unknown, Self::Unknown) => true,
-            (Self::Unknown, _) => true,
-            (_, Self::Unknown) => true,
-            (Self::Number, Self::Int | Self::Float) => true,
-            (Self::Int | Self::Float, Self::Number) => true,
-            (Self::List(l0), Self::List(r0)) => l0 == r0,
-            (Self::Map(l0, l1), Self::Map(r0, r1)) => l0 == r0 && l1 == r1,
-            (Self::Union(l0), Self::Union(r0)) => l0 == r0,
-            (Self::ClassRef(l0), Self::ClassRef(r0)) => l0 == r0,
-            (Self::FunctionRef(l0), Self::FunctionRef(r0)) => l0 == r0,
-            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
-        }
-    }
-}
-
-impl Eq for Type {}
 
 impl Type {
+    /// This is very similar to FieldType::is_subtype_of.
+    pub fn is_subtype_of(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        if let Type::Union(items) = other {
+            if items.iter().any(|x| self.is_subtype_of(x)) {
+                return true;
+            }
+        }
+        match (self, other) {
+            (Type::Unknown, _) => true,
+            (_, Type::Unknown) => true,
+            (_, Type::Undefined) => false,
+            (_, Type::None) => false,
+            (Type::Undefined, _) => false,
+            (Type::None, _) => false,
+
+            // Handle types that nest other types.
+            (Type::List(l0), Type::List(r0)) => l0.is_subtype_of(r0),
+            (Type::List(_), _) => false,
+            (Type::Map(l0, l1), Type::Map(r0, r1)) => l0.is_subtype_of(r0) && l1.is_subtype_of(r1),
+            (Type::Map(_, _), _) => false,
+
+            (Type::Int, Type::Number) => true,
+            (Type::Int, _) => false,
+
+            (Type::Float, Type::Number) => true,
+            (Type::Float, _) => false,
+
+            // This is cause jinja is dumb and doesn't know the difference between int and float
+            (Type::Number, Type::Float | Type::Int) => true,
+            (Type::Number, _) => false,
+
+            (Type::Literal(LiteralValue::Int(_)), Type::Int | Type::Number) => true,
+            (Type::Literal(LiteralValue::Bool(_)), Type::Bool) => true,
+            (Type::Literal(LiteralValue::String(_)), Type::String) => true,
+            (Type::Literal(_), _) => false,
+
+            (Type::Union(l0), _) => l0.iter().all(|x| x.is_subtype_of(other)),
+
+            (Type::Both(l0, r0), _) => l0.is_subtype_of(other) || r0.is_subtype_of(other),
+            (_, Type::Both(l0, r0)) => self.is_subtype_of(l0) && self.is_subtype_of(r0),
+
+            (Type::Tuple(l0), Type::Tuple(r0)) => {
+                if l0.len() != r0.len() {
+                    return false;
+                }
+                l0.iter().zip(r0.iter()).all(|(l, r)| l.is_subtype_of(r))
+            }
+            (Type::Tuple(_), _) => false,
+
+            (Type::ClassRef(_), _) => false,
+            (Type::FunctionRef(_), _) => false,
+            (Type::Alias { resolved, .. }, _) => resolved.is_subtype_of(other),
+            (Type::RecursiveTypeAlias(_), _) => false,
+            (Type::Image, _) => false,
+            (Type::Audio, _) => false,
+            (Type::String, _) => false,
+            (Type::Bool, _) => false,
+        }
+    }
+
+    // pub fn matches(&self, r: &Self) -> bool {
+    //     match (self, r) {
+    //         (Self::Unknown, Self::Unknown) => true,
+    //         (Self::Unknown, _) => true,
+    //         (_, Self::Unknown) => true,
+    //         (Self::Number, Self::Int | Self::Float) => true,
+    //         (Self::Int | Self::Float, Self::Number) => true,
+    //         (Self::List(l0), Self::List(r0)) => l0.matches(r0),
+    //         (Self::Map(l0, l1), Self::Map(r0, r1)) => l0.matches(r0) && l1.matches(r1),
+    //         (Self::Union(l0), Self::Union(r0)) => {
+    //             // Sort l0 and r0 to make sure the order doesn't matter
+    //             let mut l0 = l0.clone();
+    //             let mut r0 = r0.clone();
+    //             l0.sort();
+    //             r0.sort();
+    //             l0 == r0
+    //         }
+    //         (l0, Self::Union(r0)) => r0.iter().any(|x| l0.matches(x)),
+    //         (Self::ClassRef(l0), Self::ClassRef(r0)) => l0 == r0,
+    //         (Self::FunctionRef(l0), Self::FunctionRef(r0)) => l0 == r0,
+    //         _ => core::mem::discriminant(self) == core::mem::discriminant(r),
+    //     }
+    // }
+
     pub fn name(&self) -> String {
         match self {
             Type::Unknown => "<unknown>".into(),
@@ -59,6 +150,7 @@ impl Type {
             Type::Number => "number".into(),
             Type::String => "string".into(),
             Type::Bool => "bool".into(),
+            Type::Literal(value) => format!("literal[{value}]"),
             Type::List(l) => format!("list[{}]", l.name()),
             Type::Map(k, v) => format!("map[{}, {}]", k.name(), v.name()),
             Type::Tuple(v) => format!(
@@ -69,13 +161,27 @@ impl Type {
                 "({})",
                 v.iter().map(|x| x.name()).collect::<Vec<_>>().join(" | ")
             ),
-            Type::ClassRef(name) => format!("class {}", name),
-            Type::FunctionRef(name) => format!("function {}", name),
+            Type::Both(l, r) => format!("{} & {}", l.name(), r.name()),
+            Type::ClassRef(name) => format!("class {name}"),
+            Type::FunctionRef(name) => format!("function {name}"),
+            Type::Alias { name, resolved, .. } => {
+                format!("type alias {name} (resolves to {})", resolved.name())
+            }
+            Type::RecursiveTypeAlias(name) => format!("recursive type alias {name}"),
             Type::Image => "image".into(),
+            Type::Audio => "audio".into(),
         }
     }
 
-    pub fn merge<'a, I>(v: I) -> Type
+    pub fn is_optional(&self) -> bool {
+        match self {
+            Type::None => true,
+            Type::Union(v) => v.iter().any(|x| x.is_optional()),
+            _ => false,
+        }
+    }
+
+    pub fn merge<I>(v: I) -> Type
     where
         I: IntoIterator<Item = Type>,
     {
@@ -110,10 +216,15 @@ impl BitOr for Type {
                 Type::Union(v)
             }
             (t1, t2) => {
-                if t1 == t2 {
+                if t1.is_subtype_of(&t2) {
                     return t1;
                 }
-                Type::Union(vec![t1, t2])
+                if t2.is_subtype_of(&t1) {
+                    return t2;
+                }
+                let mut types = vec![t1, t2];
+                types.sort();
+                Type::Union(types)
             }
         }
     }
@@ -129,11 +240,20 @@ enum Scope {
 pub struct PredefinedTypes {
     functions: HashMap<String, (Type, Vec<(String, Type)>)>,
     classes: HashMap<String, HashMap<String, Type>>,
+    /// TODO: See the comment for [`Type::AliasRef`].
+    ///
+    /// We should use this but we can't without a significant refactor.
+    aliases: HashMap<String, Type>,
     // Variable name <--> Definition
     variables: HashMap<String, Type>,
     scopes: Vec<Scope>,
 
     errors: Vec<TypeError>,
+}
+
+pub enum JinjaContext {
+    Prompt,
+    Parsing,
 }
 
 impl PredefinedTypes {
@@ -154,12 +274,39 @@ impl PredefinedTypes {
             .collect()
     }
 
-    pub fn default() -> Self {
+    pub fn default(context: JinjaContext) -> Self {
         Self {
-            functions: HashMap::from([(
-                "baml::Chat".into(),
-                (Type::String, vec![("role".into(), Type::String)]),
-            )]),
+            functions: HashMap::from([
+                (
+                    "baml::Chat".into(),
+                    (Type::String, vec![("role".into(), Type::String)]),
+                ),
+                (
+                    "baml::OutputFormat".into(),
+                    (
+                        Type::String,
+                        vec![
+                            ("prefix".into(), Type::merge(vec![Type::String, Type::None])),
+                            (
+                                "or_splitter".into(),
+                                Type::merge(vec![Type::String, Type::None]),
+                            ),
+                            (
+                                "enum_value_prefix".into(),
+                                Type::merge(vec![Type::String, Type::None]),
+                            ),
+                            (
+                                "always_hoist_enums".into(),
+                                Type::merge(vec![Type::Bool, Type::None]),
+                            ),
+                            (
+                                "hoisted_class_prefix".into(),
+                                Type::merge(vec![Type::String, Type::None]),
+                            ),
+                        ],
+                    ),
+                ),
+            ]),
             classes: HashMap::from([
                 (
                     "baml::Client".into(),
@@ -171,10 +318,16 @@ impl PredefinedTypes {
                 (
                     "baml::Context".into(),
                     HashMap::from([
-                        ("output_format".into(), Type::String),
+                        (
+                            "output_format".into(),
+                            Type::Both(
+                                Type::String.into(),
+                                Type::FunctionRef("baml::OutputFormat".into()).into(),
+                            ),
+                        ),
                         ("client".into(), Type::ClassRef("baml::Client".into())),
                         (
-                            "env".into(),
+                            "tags".into(),
                             Type::Map(Box::new(Type::String), Box::new(Type::String)),
                         ),
                     ]),
@@ -201,10 +354,14 @@ impl PredefinedTypes {
                     ]),
                 ),
             ]),
-            variables: HashMap::from([
-                ("ctx".into(), Type::ClassRef("baml::Context".into())),
-                ("_".into(), Type::ClassRef("baml::BuiltIn".into())),
-            ]),
+            variables: match context {
+                JinjaContext::Prompt => HashMap::from([
+                    ("ctx".into(), Type::ClassRef("baml::Context".into())),
+                    ("_".into(), Type::ClassRef("baml::BuiltIn".into())),
+                ]),
+                JinjaContext::Parsing => Default::default(),
+            },
+            aliases: HashMap::new(),
             scopes: Vec::new(),
             errors: Vec::new(),
         }
@@ -318,6 +475,10 @@ impl PredefinedTypes {
         self.classes.insert(name.to_string(), fields);
     }
 
+    pub fn add_alias(&mut self, name: &str, target: Type) {
+        self.aliases.insert(name.to_string(), target);
+    }
+
     pub fn add_variable(&mut self, name: &str, t: Type) {
         match self.scopes.last_mut() {
             Some(Scope::Branch(true_vars, false_vars, branch_cond)) => {
@@ -383,8 +544,20 @@ impl PredefinedTypes {
         let (ret, args) = val.unwrap();
         let mut errors = Vec::new();
 
+        // Check how many args are required.
+        let mut optional_args = vec![];
+        for (name, t) in args.iter().rev() {
+            if !t.is_optional() {
+                break;
+            }
+            optional_args.push(name);
+        }
+        let required_args = args.len() - optional_args.len();
+
         // Check count
-        if positional_args.len() + kwargs.len() != args.len() {
+        if positional_args.len() + kwargs.len() < required_args
+            || (positional_args.len() + kwargs.len()) > args.len()
+        {
             errors.push(TypeError::new_wrong_arg_count(
                 func,
                 span,
@@ -392,41 +565,47 @@ impl PredefinedTypes {
                 positional_args.len() + kwargs.len(),
             ));
         } else {
+            let mut unused_args = args.iter().map(|(name, _)| name).collect::<HashSet<_>>();
             // Check types
             for (i, (name, t)) in args.iter().enumerate() {
                 if i < positional_args.len() {
+                    unused_args.remove(name);
                     let arg_t = &positional_args[i];
-                    if arg_t != t {
+                    if !arg_t.is_subtype_of(t) {
                         errors.push(TypeError::new_wrong_arg_type(
                             func,
                             span,
                             name,
-                            span.clone(),
+                            span,
                             t.clone(),
                             arg_t.clone(),
                         ));
                     }
-                } else {
-                    if let Some(arg_t) = kwargs.get(name.as_str()) {
-                        if arg_t != t {
-                            errors.push(TypeError::new_wrong_arg_type(
-                                func,
-                                span,
-                                name,
-                                span.clone(),
-                                t.clone(),
-                                arg_t.clone(),
-                            ));
-                        }
-                    } else {
-                        errors.push(TypeError::new_missing_arg(func, span, name));
+                } else if let Some(arg_t) = kwargs.get(name.as_str()) {
+                    unused_args.remove(name);
+                    if !arg_t.is_subtype_of(t) {
+                        errors.push(TypeError::new_wrong_arg_type(
+                            func,
+                            span,
+                            name,
+                            span,
+                            t.clone(),
+                            arg_t.clone(),
+                        ));
                     }
+                } else if !optional_args.contains(&name) {
+                    errors.push(TypeError::new_missing_arg(func, span, name));
                 }
             }
 
             kwargs.iter().for_each(|(name, _)| {
                 if !args.iter().any(|(arg_name, _)| arg_name == name) {
-                    errors.push(TypeError::new_unknown_arg(func, span, name));
+                    errors.push(TypeError::new_unknown_arg(
+                        func,
+                        span,
+                        name,
+                        unused_args.clone(),
+                    ));
                 }
             });
         }

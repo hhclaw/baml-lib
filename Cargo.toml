@@ -11,17 +11,26 @@ default-members = [
 anyhow = "1.0"
 askama = "0.12.1"
 base64 = "0.22.1"
+bstd = { path = "bstd" }
+bytes = "1.6.0"
 cfg-if = "1.0.0"
+clap = { version = "4.4.6", features = ["cargo", "derive"] }
 dashmap = "5.5.3"
 derive_builder = "0.20.0"
+derive_more = { version = "0.99.18", features = ["constructor"] }
 either = "1.8.1"
 env_logger = "0.11.3"
 futures = { version = "0.3.30", features = ["executor"] }
-log = "0.4.20"
+http = "1.1.0"
+http-body = "1.0.0"
 indexmap = { version = "2.1.0", features = ["serde"] }
-indoc = "2.0.1"
+indoc = "2.0.5"
+log = "0.4.20"
 instant = "0.1"
+pretty_assertions = "1.4.1"
+rand = "0.8.5"
 regex = "1.10.4"
+scopeguard = "1.2.0"
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 static_assertions = "1.1.0"
@@ -32,6 +41,24 @@ web-time = "1.1.0"
 baml-types = { path = "baml-lib/baml-types" }
 internal-baml-core = { path = "baml-lib/baml-core" }
 internal-baml-jinja = { path = "baml-lib/jinja" }
+minijinja = { version = "1.0.16", default-features = false, features = [
+  "macros",
+  "builtins",
+  "debug",
+  "preserve_order",
+  "adjacent_loop_items",
+  "unicode",
+  "json",
+  "unstable_machinery",
+  "unstable_machinery_serde",
+  "custom_syntax",
+  "internal_debug",
+  "deserialization",
+  # We don't want to use these features:
+  # multi_template
+  # loader
+  #
+] }
 
 [workspace.package]
 version = "0.40.1"

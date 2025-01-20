@@ -1,28 +1,21 @@
-use std::ops::Deref;
+use crate::types::Attributes;
 
-use crate::{
-    printer::{WithSerializeableContent, WithStaticRenames},
-    types::{DynamicStringAttributes, StaticStringAttributes, ToStringAttributes},
-    ParserDatabase,
-};
+use super::{ClassWalker, Walker};
 
-use super::{ClassWalker, VariantWalker, Walker};
-
-use internal_baml_schema_ast::ast::{self, FieldType, Identifier, WithName, WithSpan};
-use serde_json::json;
+use internal_baml_schema_ast::ast::{self, FieldType, WithName, WithSpan};
 
 /// A model field, scalar or relation.
-pub type FieldWalker<'db> = Walker<'db, (ast::ClassId, ast::FieldId, bool)>;
+pub type FieldWalker<'db> = Walker<'db, (ast::TypeExpId, ast::FieldId, bool)>;
 
 impl<'db> FieldWalker<'db> {
     /// The AST node for the field.
-    pub fn ast_field(self) -> &'db ast::Field {
+    pub fn ast_field(self) -> &'db ast::Field<FieldType> {
         &self.db.ast[self.id.0][self.id.1]
     }
 
     /// The field type.
-    pub fn r#type(self) -> &'db FieldType {
-        &self.ast_field().field_type
+    pub fn r#type(self) -> &'db Option<FieldType> {
+        &self.ast_field().expr
     }
 
     /// Traverse the field's parent model.
@@ -31,41 +24,28 @@ impl<'db> FieldWalker<'db> {
     }
 
     /// Traverse the field's attributes.
-    pub fn attributes(self) -> &'db ToStringAttributes {
+    pub fn attributes(self) -> &'db Attributes {
         &self.db.types.class_attributes[&self.id.0].field_serilizers[&self.id.1]
     }
 
-    /// Whether the field is dynamic.
-    pub fn is_dynamic(self) -> bool {
-        self.id.2
+    /// The field's default attributes.
+    pub fn get_default_attributes(&self) -> Option<&'db Attributes> {
+        let result = self
+            .db
+            .types
+            .class_attributes
+            .get(&self.id.0)
+            .and_then(|f| f.field_serilizers.get(&self.id.1));
+
+        result
     }
 
-    /// Attributes for the field.
-    pub fn static_attributes(self) -> &'db StaticStringAttributes {
-        match self.attributes() {
-            ToStringAttributes::Static(d) => d,
-            _ => panic!("Expected static attributes"),
-        }
-    }
-
-    /// Attributes for the field.
-    pub fn dynamic_attributes(self) -> &'db DynamicStringAttributes {
-        match self.attributes() {
-            ToStringAttributes::Dynamic(d) => d,
-            _ => panic!("Expected dynamic attributes"),
-        }
-    }
-
-    /// The field's alias.
-    pub fn code_for_language(self, language: &str) -> Option<&'db str> {
-        match self.db.interner.lookup(language) {
-            Some(language) => self
-                .dynamic_attributes()
-                .code
-                .get(&language)
-                .and_then(|&s| self.db.interner.get(s)),
-            None => None,
-        }
+    /// The field's docstring.
+    pub fn get_documentation(&self) -> Option<String> {
+        self.ast_field()
+            .documentation
+            .as_ref()
+            .map(|c| c.text.clone())
     }
 }
 
@@ -79,96 +59,5 @@ impl<'db> WithName for FieldWalker<'db> {
 impl<'db> WithSpan for FieldWalker<'db> {
     fn span(&self) -> &internal_baml_diagnostics::Span {
         self.ast_field().span()
-    }
-}
-
-impl<'db> WithSerializeableContent for (&ParserDatabase, &FieldType) {
-    fn serialize_data(
-        &self,
-        variant: Option<&VariantWalker<'_>>,
-        db: &'_ ParserDatabase,
-    ) -> serde_json::Value {
-        match self.1 {
-            FieldType::Tuple(..) | FieldType::Dictionary(..) => json!({
-                "rtype": "unsupported",
-                "optional": false,
-            }),
-            FieldType::Union(arity, fts, _) => json!({
-                "rtype": "union",
-                "optional": arity.is_optional(),
-                "options": fts.iter().map(|ft| (self.0, ft).serialize_data(variant, db)).collect::<Vec<_>>(),
-            }),
-            FieldType::List(ft, dims, _) => json!({
-                "rtype": "list",
-                "dims": dims,
-                "inner": (self.0, ft.deref()).serialize_data(variant, db),
-            }),
-            FieldType::Identifier(arity, Identifier::Primitive(name, ..)) => {
-                json!({
-                    "rtype": "primitive",
-                    "optional": arity.is_optional(),
-                    "value": match name {
-                        baml_types::TypeValue::Bool => "bool",
-                        baml_types::TypeValue::Int => "int",
-                        baml_types::TypeValue::Float => "float",
-                        baml_types::TypeValue::String => "string",
-                        baml_types::TypeValue::Null => "null",
-                        baml_types::TypeValue::Image => "image",
-                    }
-                })
-            }
-            FieldType::Identifier(arity, Identifier::Local(name, ..)) => {
-                match self.0.find_type_by_str(name) {
-                    Some(either::Either::Left(cls)) => {
-                        let mut class_type = cls.serialize_data(variant, db);
-                        let Some(obj) = class_type.as_object_mut() else {
-                            return class_type;
-                        };
-                        obj.insert("optional".to_string(), arity.is_optional().into());
-                        class_type
-                    }
-                    Some(either::Either::Right(enm)) => {
-                        json!({
-                            "rtype": "enum",
-                            "optional": arity.is_optional(),
-                            "name": enm.alias(variant, db),
-                        })
-                    }
-                    None => json!({
-                        "rtype": "unsupported",
-                        "optional": false,
-                    }),
-                }
-            }
-            FieldType::Identifier(..) => serde_json::Value::Null,
-        }
-    }
-}
-
-impl<'db> WithSerializeableContent for FieldWalker<'db> {
-    fn serialize_data(
-        &self,
-        variant: Option<&VariantWalker<'_>>,
-        db: &'_ ParserDatabase,
-    ) -> serde_json::Value {
-        json!({
-            "name": self.alias(variant, db),
-            "meta": self.meta(variant, db),
-            "type_meta": (self.db, self.r#type()).serialize_data(variant, db),
-        })
-    }
-}
-
-impl<'db> WithStaticRenames<'db> for FieldWalker<'db> {
-    fn get_override(&self, variant: &VariantWalker<'db>) -> Option<&'db ToStringAttributes> {
-        variant.find_serializer_field_attributes(self.model().name(), self.name())
-    }
-
-    fn get_default_attributes(&self) -> Option<&'db ToStringAttributes> {
-        self.db
-            .types
-            .class_attributes
-            .get(&self.id.0)
-            .and_then(|f| f.field_serilizers.get(&self.id.1))
     }
 }

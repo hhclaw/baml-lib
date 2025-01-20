@@ -1,21 +1,19 @@
 use either::Either;
 use internal_baml_diagnostics::DatamodelError;
-use internal_baml_schema_ast::ast::{FuncArguementId, Identifier, WithIdentifier, WithSpan};
-use serde_json::json;
+use internal_baml_schema_ast::ast::{ArgumentId, Identifier, WithIdentifier, WithSpan};
+use internal_llm_client::ClientSpec;
 
 use crate::{
     ast::{self, WithName},
-    printer::{serialize_with_printer, WithSerializeableContent},
     types::FunctionType,
-    ParserDatabase, WithSerialize,
 };
 
-use super::{ClassWalker, ClientWalker, ConfigurationWalker, EnumWalker, VariantWalker, Walker};
+use super::{ClassWalker, ConfigurationWalker, EnumWalker, TypeWalker, Walker};
 
-use std::{collections::HashMap, iter::ExactSizeIterator};
+use std::iter::ExactSizeIterator;
 
 /// A `function` declaration in the Prisma schema.
-pub type FunctionWalker<'db> = Walker<'db, (bool, ast::FunctionId)>;
+pub type FunctionWalker<'db> = Walker<'db, (bool, ast::ValExpId)>;
 
 impl<'db> FunctionWalker<'db> {
     /// The name of the function.
@@ -23,107 +21,70 @@ impl<'db> FunctionWalker<'db> {
         self.ast_function().name()
     }
 
-    /// The name of the function.
-    pub fn identifier(self) -> &'db Identifier {
-        self.ast_function().identifier()
-    }
-
     /// The ID of the function in the db
-    pub fn function_id(self) -> ast::FunctionId {
+    pub fn function_id(self) -> ast::ValExpId {
         self.id.1
     }
 
     /// The AST node.
-    pub fn ast_function(self) -> &'db ast::Function {
+    pub fn ast_function(self) -> &'db ast::ValueExprBlock {
         &self.db.ast[self.id.1]
     }
 
     /// The name of the function.
     pub fn is_positional_args(self) -> bool {
-        match self.ast_function().input() {
-            ast::FunctionArgs::Named(_) => false,
-            ast::FunctionArgs::Unnamed(_) => true,
-        }
+        false
     }
 
     /// Arguments of the function.
     pub fn find_input_arg_by_name(self, name: &str) -> Option<ArgWalker<'db>> {
-        match self.ast_function().input() {
-            ast::FunctionArgs::Named(arg_list) => {
-                arg_list.iter_args().find_map(|(idx, (idn, _))| {
-                    if idn.name() == name {
-                        Some(ArgWalker {
-                            db: self.db,
-                            id: (self.id.1, true, idx),
-                        })
-                    } else {
-                        None
-                    }
-                })
-            }
-            ast::FunctionArgs::Unnamed(_) => None,
-        }
-    }
-
-    /// Arguments of the function.
-    pub fn find_input_arg_by_position(self, position: u32) -> Option<ArgWalker<'db>> {
-        match self.ast_function().input() {
-            ast::FunctionArgs::Named(_) => None,
-            ast::FunctionArgs::Unnamed(_) => {
-                if position == 0_u32 {
+        self.ast_function().input().and_then(|args| {
+            args.iter_args().find_map(|(idx, (idn, _))| {
+                if idn.name() == name {
                     Some(ArgWalker {
                         db: self.db,
-                        id: (self.id.1, true, FuncArguementId(position)),
+                        id: (self.id.1, true, idx),
                     })
                 } else {
                     None
                 }
-            }
-        }
+            })
+        })
+    }
+
+    /// Arguments of the function.
+    pub fn find_input_arg_by_position(self, position: u32) -> Option<ArgWalker<'db>> {
+        self.walk_input_args().find(|arg| {
+            let span = arg.ast_arg().1.span();
+            span.contains(position as usize)
+        })
     }
 
     /// Iterates over the input arguments of the function.
     pub fn walk_input_args(self) -> impl ExactSizeIterator<Item = ArgWalker<'db>> {
-        let range_end = match self.ast_function().input() {
-            ast::FunctionArgs::Named(arg_list) => arg_list.iter_args().len(),
-            ast::FunctionArgs::Unnamed(_) => 1,
-        } as u32;
-
-        (0..range_end).map(move |f| ArgWalker {
-            db: self.db,
-            id: (self.id.1, true, FuncArguementId(f)),
-        })
+        match self.ast_function().input() {
+            Some(input) => {
+                let range_end = input.iter_args().len() as u32;
+                (0..range_end)
+                    .map(move |f| ArgWalker {
+                        db: self.db,
+                        id: (self.id.1, true, ArgumentId(f)),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            }
+            None => Vec::new().into_iter(),
+        }
     }
 
     /// Iterates over the output arguments of the function.
     pub fn walk_output_args(self) -> impl ExactSizeIterator<Item = ArgWalker<'db>> {
-        let range_end = match self.ast_function().output() {
-            ast::FunctionArgs::Named(arg_list) => arg_list.iter_args().len(),
-            ast::FunctionArgs::Unnamed(_) => 1,
-        } as u32;
+        let range_end = 1;
 
         (0..range_end).map(move |f| ArgWalker {
             db: self.db,
-            id: (self.id.1, false, FuncArguementId(f)),
+            id: (self.id.1, false, ArgumentId(f)),
         })
-    }
-
-    /// Iterates over the variants for this function.
-    pub fn walk_variants(self) -> impl ExactSizeIterator<Item = VariantWalker<'db>> {
-        assert!(!self.id.0, "Only old functions have variants");
-        self.db
-            .ast()
-            .iter_tops()
-            .filter_map(|(id, t)| match (id, t) {
-                (ast::TopId::Variant(id), ast::Top::Variant(impl_))
-                    if impl_.function_name().name() == self.name() =>
-                {
-                    Some(VariantWalker { db: self.db, id })
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
     }
 
     /// All the test cases for this function.
@@ -158,41 +119,89 @@ impl<'db> FunctionWalker<'db> {
             .template
             .as_str()
     }
+}
 
-    /// The client for the function
-    pub fn client(self) -> Option<ClientWalker<'db>> {
+// impl AstClientSpec {
+//     pub fn required_env_vars(&self) -> HashSet<String> {
+//         match self {
+//             ClientSpec::Named(n) => HashSet::new(),
+//             ClientSpec::Shorthand(_, _) => HashSet::new(),
+//         }
+//     }
+// }
+
+impl<'db> FunctionWalker<'db> {
+    /// Returns the client spec for the function, if it is well-formed
+    pub fn client_spec(self) -> Result<ClientSpec, DatamodelError> {
         assert!(self.id.0, "Only new functions have clients");
-        let client = self.metadata().client.as_ref()?;
-        self.db.find_client(client.0.as_str())
+        let Some(client) = self.metadata().client.as_ref() else {
+            return Err(DatamodelError::new_validation_error(
+                "Client metadata is missing.",
+                self.span().clone(),
+            ));
+        };
+        match ClientSpec::new_from_id(client.0.as_str()) {
+            Ok(ClientSpec::Named(name)) => {
+                if let Some(client) = self.db.find_client(&name) {
+                    Ok(ClientSpec::Named(name))
+                } else {
+                    let clients = self
+                        .db
+                        .walk_clients()
+                        .map(|c| c.name().to_string())
+                        .collect::<Vec<_>>();
+                    Err(DatamodelError::not_found_error(
+                        "Client",
+                        &client.0,
+                        client.1.clone(),
+                        clients.clone(),
+                        false,
+                    ))
+                }
+            }
+            Ok(spec) => Ok(spec),
+            Err(e) => Err(DatamodelError::new_validation_error(
+                &e.to_string(),
+                client.1.clone(),
+            )),
+        }
+    }
+}
+impl<'db> WithIdentifier for FunctionWalker<'db> {
+    /// The name of the function.
+    fn identifier(&self) -> &'db Identifier {
+        self.ast_function().identifier()
     }
 }
 
 /// A `function` declaration in the Prisma schema.
-pub type ArgWalker<'db> = super::Walker<'db, (ast::FunctionId, bool, FuncArguementId)>;
+pub type ArgWalker<'db> = super::Walker<'db, (ast::ValExpId, bool, ArgumentId)>;
 
 impl<'db> ArgWalker<'db> {
     /// The ID of the function in the db
-    pub fn function_id(self) -> ast::FunctionId {
+    pub fn function_id(self) -> ast::ValExpId {
         self.id.0
     }
 
     /// The AST node.
-    pub fn ast_function(self) -> &'db ast::Function {
+    pub fn ast_function(self) -> &'db ast::ValueExprBlock {
         &self.db.ast[self.id.0]
     }
 
     /// The AST node.
-    pub fn ast_arg(self) -> (Option<&'db Identifier>, &'db ast::FunctionArg) {
-        let args = match self.id.1 {
-            true => self.ast_function().input(),
-            false => self.ast_function().output(),
-        };
-        match args {
-            ast::FunctionArgs::Named(arg_list) => {
-                let res = &arg_list[self.id.2];
+    pub fn ast_arg(self) -> (Option<&'db Identifier>, &'db ast::BlockArg) {
+        match self.id.1 {
+            true => {
+                let args = self.ast_function().input();
+                let res = &args.expect("Expected input args")[self.id.2];
                 (Some(&res.0), &res.1)
             }
-            ast::FunctionArgs::Unnamed(arg) => (None, arg),
+
+            false => {
+                let output = self.ast_function().output();
+                let res = output.expect("Error: Output is undefined for function ID");
+                (None, res)
+            }
         }
     }
 
@@ -203,7 +212,7 @@ impl<'db> ArgWalker<'db> {
 
     /// The name of the function.
     pub fn is_optional(self) -> bool {
-        self.field_type().is_nullable()
+        self.field_type().is_optional()
     }
 
     /// The name of the function.
@@ -212,9 +221,8 @@ impl<'db> ArgWalker<'db> {
         if self.id.1 { input } else { output }
             .iter()
             .filter_map(|f| match self.db.find_type_by_str(f) {
-                Some(Either::Left(_cls)) => None,
-                Some(Either::Right(walker)) => Some(walker),
-                None => None,
+                Some(TypeWalker::Enum(walker)) => Some(walker),
+                _ => None,
             })
     }
 
@@ -224,9 +232,8 @@ impl<'db> ArgWalker<'db> {
         if self.id.1 { input } else { output }
             .iter()
             .filter_map(|f| match self.db.find_type_by_str(f) {
-                Some(Either::Left(walker)) => Some(walker),
-                Some(Either::Right(_enm)) => None,
-                None => None,
+                Some(TypeWalker::Class(walker)) => Some(walker),
+                _ => None,
             })
     }
 }
@@ -234,115 +241,5 @@ impl<'db> ArgWalker<'db> {
 impl WithSpan for FunctionWalker<'_> {
     fn span(&self) -> &internal_baml_diagnostics::Span {
         self.ast_function().span()
-    }
-}
-
-impl WithIdentifier for ArgWalker<'_> {
-    fn identifier(&self) -> &ast::Identifier {
-        self.ast_arg().0.unwrap()
-    }
-}
-
-impl<'db> WithSerializeableContent for ArgWalker<'db> {
-    fn serialize_data(
-        &self,
-        variant: Option<&VariantWalker<'_>>,
-        db: &'_ ParserDatabase,
-    ) -> serde_json::Value {
-        json!({
-            "rtype": "inline",
-            "value": (self.db, &self.ast_arg().1.field_type).serialize_data(variant, db)
-        })
-    }
-}
-
-impl<'db> WithSerializeableContent for FunctionWalker<'db> {
-    fn serialize_data(
-        &self,
-        variant: Option<&VariantWalker<'_>>,
-        db: &'_ ParserDatabase,
-    ) -> serde_json::Value {
-        if let Some((idx, _)) = variant.and_then(|v| v.properties().output_adapter.as_ref()) {
-            let adapter = &variant.unwrap().ast_variant()[*idx];
-
-            return json!({
-                "rtype": "output",
-                "value": (self.db, &adapter.from).serialize_data(variant, db)
-            });
-        }
-
-        // TODO: We should handle the case of multiple output args
-        json!({
-            "rtype": "output",
-            "value": self.walk_output_args()
-                        .map(|f| f.serialize_data(variant, db))
-                        .next()
-                        .unwrap_or(serde_json::Value::Null)
-        })
-    }
-}
-
-impl<'db> WithSerialize for FunctionWalker<'db> {
-    fn serialize(
-        &self,
-        db: &'_ ParserDatabase,
-        variant: Option<&VariantWalker<'_>>,
-        block: Option<&internal_baml_prompt_parser::ast::PrinterBlock>,
-        span: &internal_baml_diagnostics::Span,
-    ) -> Result<String, internal_baml_diagnostics::DatamodelError> {
-        let printer_template = match &block.and_then(|b| b.printer.as_ref()) {
-            Some((p, _)) => self
-                .db
-                .find_printer(p)
-                .map(|w| w.printer().template().to_string()),
-            _ => None,
-        };
-        // Eventually we should validate what parameters are in meta.
-        match serialize_with_printer(false, printer_template, self.serialize_data(variant, db)) {
-            Ok(val) => Ok(val),
-            Err(e) => Err(DatamodelError::new_validation_error(
-                &format!("Error serializing output for {}\n{}", self.name(), e),
-                span.clone(),
-            )),
-        }
-    }
-
-    fn output_format(
-        &self,
-        db: &'_ ParserDatabase,
-        span: &internal_baml_diagnostics::Span,
-    ) -> Result<String, internal_baml_diagnostics::DatamodelError> {
-        let class_schema = self.serialize(db, None, None, span)?;
-
-        let mut enum_schemas = self
-            .walk_output_args()
-            .flat_map(|arg| arg.required_enums())
-            .map(|e| (e.name().to_string(), e))
-            .collect::<HashMap<_, _>>()
-            .iter()
-            // TODO(sam) - if enum serialization fails, then we do not surface the error to the user.
-            // That is bad!!!!!!!
-            .filter_map(
-                |(_, e)| match e.serialize(db, None, None, e.identifier().span()) {
-                    Ok(enum_schema) => Some((e.name().to_string(), enum_schema)),
-                    Err(_) => None,
-                },
-            )
-            .collect::<Vec<_>>();
-
-        if enum_schemas.is_empty() {
-            Ok(class_schema)
-        } else {
-            // Enforce a stable order on enum schemas. Without this, the order is actually unstable, and the order can ping-pong
-            // when the vscode ext re-renders the live preview
-            enum_schemas.sort_by_key(|(name, _)| name.to_string());
-
-            let enum_schemas = enum_schemas
-                .into_iter()
-                .map(|(_, enum_schema)| enum_schema)
-                .collect::<Vec<_>>();
-            let enum_schemas = enum_schemas.join("\n---\n\n");
-            Ok(format!("{}\n\n{}", class_schema, enum_schemas))
-        }
     }
 }

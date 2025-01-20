@@ -139,7 +139,7 @@ impl LockFileWrapper {
         let content = std::fs::read_to_string(&path_buf)?;
         let mut parsed: LockFileWrapper = serde_json::from_str(&content)?;
         let len = content.len();
-        parsed.span = Some(Span::new(SourceFile::from(content), 0, len));
+        parsed.span = Some(Span::new(SourceFile::from((path_buf, content)), 0, len));
         Ok(parsed)
     }
 

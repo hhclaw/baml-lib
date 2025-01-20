@@ -1,4 +1,9 @@
-use crate::{pretty_print::pretty_print, Span};
+use colored::{ColoredString, Colorize};
+
+use crate::{
+    pretty_print::{pretty_print, DiagnosticColorer},
+    Span,
+};
 use std::iter::Iterator;
 use std::{borrow::Cow, ops::Index};
 
@@ -64,8 +69,8 @@ impl DatamodelError {
         DatamodelError { message, span }
     }
 
-    pub fn new_internal_error(error: anyhow::Error, span: Span) -> Self {
-        Self::new(format!("Internal error occurred: {error}"), span)
+    pub fn new_anyhow_error(error: anyhow::Error, span: Span) -> Self {
+        Self::new(format!("{error:#}"), span)
     }
 
     pub fn new_static(message: &'static str, span: Span) -> Self {
@@ -95,6 +100,10 @@ impl DatamodelError {
     ) -> DatamodelError {
         let msg = format!("Function \"{function_name}\" takes {required_count} arguments, but received {given_count}.");
         Self::new(msg, span)
+    }
+
+    pub fn new_client_error(message: impl Into<Cow<'static, str>>, span: Span) -> DatamodelError {
+        Self::new(message, span)
     }
 
     pub fn new_attribute_argument_not_found_error(
@@ -255,6 +264,13 @@ impl DatamodelError {
         Self::new(msg, span)
     }
 
+    pub fn new_invalid_function_syntax_error(func_name: &str, span: Span) -> DatamodelError {
+        Self::new(
+            format!("Invalid syntax for function \"{func_name}\". Use:\nfunction {func_name}(params...) -> ReturnType {{ ... }}"),
+            span,
+        )
+    }
+
     pub fn new_duplicate_enum_value_error(
         enum_name: &str,
         value_name: &str,
@@ -334,7 +350,7 @@ impl DatamodelError {
     }
 
     pub fn new_field_validation_error(
-        message: &str,
+        message: String,
         container_type: &str,
         container_name: &str,
         field: &str,
@@ -395,8 +411,23 @@ impl DatamodelError {
         type_name: &str,
         name: &str,
         span: Span,
-        names: Vec<String>,
+        mut names: Vec<String>,
+        include_primitives: bool,
     ) -> DatamodelError {
+        // Include a list of primitives in the names
+        if include_primitives {
+            let primitives = vec![
+                "int".to_string(),
+                "float".to_string(),
+                "bool".to_string(),
+                "string".to_string(),
+                "image".to_string(),
+                "audio".to_string(),
+                "null".to_string(),
+            ];
+            names.extend(primitives);
+        }
+
         let close_names = sort_by_match(name, &names, Some(3));
         let suggestions = if names.is_empty() {
             "".to_string()
@@ -465,7 +496,36 @@ impl DatamodelError {
             )
         };
 
-        Self::new(format!("{}{}", prefix, suggestions), span)
+        Self::new(format!("{prefix}{suggestions}"), span)
+    }
+
+    pub fn new_client_not_found_error(
+        client_name: &str,
+        span: Span,
+        valid_clients: &[String],
+    ) -> DatamodelError {
+        let names = valid_clients
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let close_names = sort_by_match(client_name, &names, Some(10));
+
+        let msg = if close_names.is_empty() {
+            format!("client `{client_name}` does not exist.")
+        } else if close_names.len() == 1 {
+            format!(
+                "client `{}` does not exist. Did you mean `{}`?",
+                client_name, close_names[0]
+            )
+        } else {
+            format!(
+                "client `{}` does not exist. Did you mean one of these: `{}`?",
+                client_name,
+                close_names.join("`, `")
+            )
+        };
+
+        Self::new(msg, span)
     }
 
     pub fn new_type_not_found_error(
@@ -477,7 +537,7 @@ impl DatamodelError {
 
         let msg = if close_names.is_empty() {
             // If no names are close enough, suggest nothing or provide a generic message
-            format!("Type `{}` does not exist.", type_name)
+            format!("Type `{type_name}` does not exist.")
         } else if close_names.len() == 1 {
             // If there's only one close name, suggest it
             format!(
@@ -488,36 +548,7 @@ impl DatamodelError {
             // If there are multiple close names, suggest them all
             let suggestions = close_names.join("`, `");
             format!(
-                "Type `{}` does not exist. Did you mean one of these: `{}`?",
-                type_name, suggestions
-            )
-        };
-
-        Self::new(msg, span)
-    }
-
-    pub fn new_impl_not_found_error(
-        impl_name: &str,
-        names: Vec<String>,
-        span: Span,
-    ) -> DatamodelError {
-        let close_names = sort_by_match(impl_name, &names, Some(10));
-
-        let msg = if close_names.is_empty() {
-            // If no names are close enough, suggest nothing or provide a generic message
-            format!("impl `{}` does not exist.", impl_name)
-        } else if close_names.len() == 1 {
-            // If there's only one close name, suggest it
-            format!(
-                "impl `{}` does not exist. Did you mean `{}`?",
-                impl_name, close_names[0]
-            )
-        } else {
-            // If there are multiple close names, suggest them all
-            let suggestions = close_names.join("`, `");
-            format!(
-                "impl `{}` does not exist. Did you mean one of these: `{}`?",
-                impl_name, suggestions
+                "Type `{type_name}` does not exist. Did you mean one of these: `{suggestions}`?"
             )
         };
 
@@ -598,6 +629,13 @@ impl DatamodelError {
         Self::new(msg, span)
     }
 
+    pub fn new_type_not_allowed_as_map_key_error(span: Span) -> DatamodelError {
+        Self::new_validation_error(
+            "Maps may only have strings, enums or literal strings as keys",
+            span,
+        )
+    }
+
     pub fn span(&self) -> &Span {
         &self.span
     }
@@ -607,6 +645,23 @@ impl DatamodelError {
     }
 
     pub fn pretty_print(&self, f: &mut dyn std::io::Write) -> std::io::Result<()> {
-        pretty_print(f, self.span(), self.message.as_ref())
+        pretty_print(
+            f,
+            self.span(),
+            self.message.as_ref(),
+            &DatamodelErrorColorer {},
+        )
+    }
+}
+
+struct DatamodelErrorColorer {}
+
+impl DiagnosticColorer for DatamodelErrorColorer {
+    fn title(&self) -> &'static str {
+        "error"
+    }
+
+    fn primary_color(&self, token: &'_ str) -> ColoredString {
+        token.bright_red()
     }
 }

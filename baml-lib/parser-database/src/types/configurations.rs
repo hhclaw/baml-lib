@@ -1,14 +1,17 @@
+use baml_types::Constraint;
+use baml_types::UnresolvedValue;
 use internal_baml_diagnostics::{DatamodelError, DatamodelWarning, Span};
 use internal_baml_schema_ast::ast::{
-    ConfigurationId, PrinterConfig, RetryPolicyConfig, WithIdentifier, WithName, WithSpan,
+    Attribute, ValExpId, ValueExprBlock, WithIdentifier, WithName, WithSpan,
 };
 use regex::Regex;
+use std::{collections::HashSet, ops::Deref};
 
+use crate::attributes::constraint::attribute_as_constraint;
 use crate::{coerce, coerce_array, coerce_expression::coerce_map, context::Context};
 
 use super::{
-    ContantDelayStrategy, ExponentialBackoffStrategy, Printer, PrinterType, RetryPolicy,
-    RetryPolicyStrategy,
+    Attributes, ContantDelayStrategy, ExponentialBackoffStrategy, RetryPolicy, RetryPolicyStrategy,
 };
 
 fn dedent(s: &str) -> String {
@@ -33,71 +36,9 @@ fn dedent(s: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn visit_printer<'db>(
-    idx: ConfigurationId,
-    config: &'db PrinterConfig,
-    ctx: &mut Context<'db>,
-) {
-    let mut template = None;
-
-    config
-        .iter_fields()
-        .for_each(|(_idx, f)| match (f.name(), &f.value) {
-            (name, None) => {
-                ctx.push_error(DatamodelError::new_config_property_missing_value_error(
-                    name,
-                    config.name(),
-                    "printer",
-                    f.identifier().span().clone(),
-                ))
-            }
-            ("template", Some(val)) => match coerce::string_with_span(val, ctx.diagnostics) {
-                Some((t, span)) => template = Some((dedent(t), span.clone())),
-                None => {}
-            },
-            (name, Some(_)) => ctx.push_error(DatamodelError::new_property_not_known_error(
-                name,
-                f.identifier().span().clone(),
-                ["template"].to_vec(),
-            )),
-        });
-
-    match (
-        template,
-        coerce::string_with_span(&config.printer_type, ctx.diagnostics),
-    ) {
-        (None, _) => ctx.push_error(DatamodelError::new_validation_error(
-            "Missing `template` property",
-            config.identifier().span().clone(),
-        )),
-        (Some(template), Some(("enum", _))) => {
-            ctx.types
-                .printers
-                .insert(idx, PrinterType::Enum(Printer { template }));
-        }
-        (Some(template), Some(("type", _))) => {
-            ctx.types
-                .printers
-                .insert(idx, PrinterType::Type(Printer { template }));
-        }
-        (Some(_), Some((name, span))) => {
-            ctx.push_error(DatamodelError::new_validation_error(
-                &format!(
-                    "Unknown printer type: {}. Options are `type` or `enum`",
-                    name
-                ),
-                span.clone(),
-            ));
-        }
-        (Some(_), None) => {
-            // errors are handled by coerce::string_with_span
-        }
-    }
-}
-
 pub(crate) fn visit_retry_policy<'db>(
-    idx: ConfigurationId,
-    config: &'db RetryPolicyConfig,
+    idx: ValExpId,
+    config: &'db ValueExprBlock,
     ctx: &mut Context<'db>,
 ) {
     let mut max_reties = None;
@@ -109,7 +50,7 @@ pub(crate) fn visit_retry_policy<'db>(
 
     config
         .iter_fields()
-        .for_each(|(_idx, f)| match (f.name(), &f.value) {
+        .for_each(|(_idx, f)| match (f.name(), &f.expr) {
             (name, None) => {
                 ctx.push_error(DatamodelError::new_config_property_missing_value_error(
                     name,
@@ -118,31 +59,28 @@ pub(crate) fn visit_retry_policy<'db>(
                     f.identifier().span().clone(),
                 ))
             }
-            ("max_retries", Some(val)) => match coerce::integer(val, ctx.diagnostics) {
-                Some(val) => max_reties = Some(val as u32),
+            ("max_retries", Some(val)) => {
+                if let Some(val) = coerce::integer(val, ctx.diagnostics) {
+                    max_reties = Some(val as u32)
+                }
+            }
+            ("strategy", Some(val)) => {
+                if let Some(val) = coerce_map(val, &coerce::string_with_span, ctx.diagnostics) {
+                    if let Some(val) = visit_strategy(f.span(), val, ctx.diagnostics) {
+                        strategy = Some(val)
+                    }
+                }
+            }
+            ("options", Some(val)) => match val.to_unresolved_value(ctx.diagnostics) {
+                Some(UnresolvedValue::<Span>::Map(kv, _)) => options = Some(kv),
+                Some(other) => {
+                    ctx.push_error(DatamodelError::new_validation_error(
+                        "`options` must be a map",
+                        other.meta().clone(),
+                    ));
+                }
                 None => {}
             },
-            ("strategy", Some(val)) => {
-                match coerce_map(val, &coerce::string_with_span, ctx.diagnostics) {
-                    Some(val) => match visit_strategy(f.span(), val, ctx.diagnostics) {
-                        Some(val) => strategy = Some(val),
-                        None => {}
-                    },
-                    None => {}
-                }
-            }
-            ("options", Some(val)) => {
-                match coerce_map(val, &coerce::string_with_span, ctx.diagnostics) {
-                    Some(val) => {
-                        options = Some(
-                            val.iter()
-                                .map(|(k, v)| ((k.0.to_string(), k.1.clone()), (*v).clone()))
-                                .collect::<Vec<_>>(),
-                        );
-                    }
-                    None => {}
-                }
-            }
             (name, Some(_)) => ctx.push_error(DatamodelError::new_property_not_known_error(
                 name,
                 f.identifier().span().clone(),
@@ -186,47 +124,47 @@ fn visit_strategy(
 
     val.iter()
         .for_each(|(name_and_span, val)| match name_and_span.0 {
-            "type" => match coerce::string_with_span(val, diagnostics) {
-                Some(val) => r#type = Some(val),
-                None => {}
-            },
-            "delay_ms" => match coerce::integer(val, diagnostics) {
-                Some(val) => delay_ms = Some(val),
-                None => {}
-            },
-            "max_delay_ms" => match coerce::integer(val, diagnostics) {
-                Some(_val) => max_delay_ms = Some((_val, val.span())),
-                None => {}
-            },
-            "multiplier" => match coerce::float(val, diagnostics) {
-                Some(_val) => multiplier = Some((_val, val.span())),
-                None => {}
-            },
+            "type" => {
+                if let Some(val) = coerce::string_with_span(val, diagnostics) {
+                    r#type = Some(val)
+                }
+            }
+            "delay_ms" => {
+                if let Some(val) = coerce::integer(val, diagnostics) {
+                    delay_ms = Some(val)
+                }
+            }
+            "max_delay_ms" => {
+                if let Some(_val) = coerce::integer(val, diagnostics) {
+                    max_delay_ms = Some((_val, val.span()))
+                }
+            }
+            "multiplier" => {
+                if let Some(_val) = coerce::float(val, diagnostics) {
+                    multiplier = Some((_val, val.span()))
+                }
+            }
             _ => {}
         });
 
     match r#type {
         Some(("constant_delay", _)) => {
-            match multiplier {
-              Some((_, span)) =>
+            if let Some((_, span)) = multiplier {
                 diagnostics.push_error(
-                    internal_baml_diagnostics::DatamodelError::new_validation_error(
-                        "The `multiplier` option is not supported for the `constant_delay` strategy",
-                        span.clone(),
-                    ),
+                internal_baml_diagnostics::DatamodelError::new_validation_error(
+                    "The `multiplier` option is not supported for the `constant_delay` strategy",
+                    span.clone(),
                 ),
-                None => {}
+            )
             }
-            match max_delay_ms {
-                Some((_, span)) =>
-                  diagnostics.push_error(
-                      internal_baml_diagnostics::DatamodelError::new_validation_error(
-                          "The `max_delay_ms` option is not supported for the `constant_delay` strategy",
-                          span.clone(),
-                      ),
-                  ),
-                  None => {}
-              }
+            if let Some((_, span)) = max_delay_ms {
+                diagnostics.push_error(
+                internal_baml_diagnostics::DatamodelError::new_validation_error(
+                    "The `max_delay_ms` option is not supported for the `constant_delay` strategy",
+                    span.clone(),
+                ),
+            )
+            }
             Some(RetryPolicyStrategy::ConstantDelay(ContantDelayStrategy {
                 delay_ms: delay_ms.unwrap_or(200) as u32,
             }))
@@ -261,8 +199,8 @@ fn visit_strategy(
 }
 
 pub(crate) fn visit_test_case<'db>(
-    idx: ConfigurationId,
-    config: &'db RetryPolicyConfig,
+    idx: ValExpId,
+    config: &'db ValueExprBlock,
     ctx: &mut Context<'db>,
 ) {
     let mut functions = None;
@@ -270,7 +208,7 @@ pub(crate) fn visit_test_case<'db>(
 
     config
         .iter_fields()
-        .for_each(|(_idx, f)| match (f.name(), &f.value) {
+        .for_each(|(_idx, f)| match (f.name(), &f.expr) {
             (name, None) => {
                 ctx.push_error(DatamodelError::new_config_property_missing_value_error(
                     name,
@@ -285,11 +223,8 @@ pub(crate) fn visit_test_case<'db>(
                         "Duplicate `function` property",
                         f.identifier().span().clone(),
                     ));
-                } else {
-                    match coerce::string_with_span(val, ctx.diagnostics) {
-                        Some((t, span)) => functions = Some(vec![(t.to_string(), span.clone())]),
-                        None => {}
-                    }
+                } else if let Some((t, span)) = coerce::string_with_span(val, ctx.diagnostics) {
+                    functions = Some(vec![(t.to_string(), span.clone())])
                 }
             }
             ("functions", Some(val)) => {
@@ -298,61 +233,44 @@ pub(crate) fn visit_test_case<'db>(
                         "Duplicate `functions` property",
                         f.identifier().span().clone(),
                     ));
-                } else {
-                    match coerce_array(val, &coerce::string_with_span, ctx.diagnostics) {
-                        Some(val) => {
-                            functions = Some(
-                                val.iter()
-                                    .map(|&(t, span)| (t.to_string(), span.clone()))
-                                    .collect::<Vec<_>>(),
-                            );
-                        }
-                        None => {}
-                    }
+                } else if let Some(val) =
+                    coerce_array(val, &coerce::string_with_span, ctx.diagnostics)
+                {
+                    functions = Some(
+                        val.iter()
+                            .map(|&(t, span)| (t.to_string(), span.clone()))
+                            .collect::<Vec<_>>(),
+                    );
                 }
             }
-            ("input", Some(val)) => {
-                if !val.is_map() {
-                    ctx.diagnostics.push_warning(DatamodelWarning::new(
-                        "Direct values are not supported. Please pass in parameters by name".into(),
-                        val.span().clone(),
+            ("args", Some(val)) => match val.to_unresolved_value(ctx.diagnostics) {
+                Some(UnresolvedValue::<Span>::Map(kv, span)) => args = Some((span, kv)),
+                Some(other) => {
+                    ctx.push_error(DatamodelError::new_validation_error(
+                        "`args` must be a map",
+                        other.meta().clone(),
                     ));
-                    args = Some((f.span(), Default::default()));
-                } else {
-                    match coerce_map(val, &coerce::string_with_span, ctx.diagnostics) {
-                        Some(val) => {
-                            let params = val
-                                .iter()
-                                .map(|(k, v)| ((k.0.to_string(), (k.1.clone(), (*v).clone()))))
-                                .collect();
-                            args = Some((f.span(), params));
-                        }
-                        None => ctx.push_error(DatamodelError::new_property_not_known_error(
-                            "input",
-                            f.identifier().span().clone(),
-                            ["functions", "args"].to_vec(),
-                        )),
-                    }
                 }
-            }
-            ("args", Some(val)) => {
-                match coerce_map(val, &coerce::string_with_span, ctx.diagnostics) {
-                    Some(val) => {
-                        let params = val
-                            .iter()
-                            .map(|(k, v)| ((k.0.to_string(), (k.1.clone(), (*v).clone()))))
-                            .collect();
-                        args = Some((f.span(), params));
-                    }
-                    None => {}
-                }
-            }
+                None => {}
+            },
             (name, Some(_)) => ctx.push_error(DatamodelError::new_property_not_known_error(
                 name,
                 f.identifier().span().clone(),
                 ["functions", "args"].to_vec(),
             )),
         });
+
+    let constraints: Vec<(Constraint, Span, Span)> = config
+        .attributes
+        .iter()
+        .filter_map(|attribute| {
+            let (maybe_constraint, errors) = attribute_as_constraint(attribute);
+            for error in errors {
+                ctx.push_error(error);
+            }
+            maybe_constraint
+        })
+        .collect();
 
     match (functions, args) {
         (None, _) => ctx.push_error(DatamodelError::new_validation_error(
@@ -370,6 +288,7 @@ pub(crate) fn visit_test_case<'db>(
                     functions,
                     args,
                     args_field_span: args_field_span.clone(),
+                    constraints,
                 },
             );
         }

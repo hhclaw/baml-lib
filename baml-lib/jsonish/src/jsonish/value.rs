@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+};
 
 use baml_types::BamlMap;
 
@@ -17,13 +20,47 @@ pub enum Value {
     Null,
 
     // Complex Types
-    Object(BamlMap<String, Value>),
+    Object(Vec<(String, Value)>),
     Array(Vec<Value>),
 
     // Fixed types
     Markdown(String, Box<Value>),
     FixedJson(Box<Value>, Vec<Fixes>),
     AnyOf(Vec<Value>, String),
+}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+
+        match self {
+            Value::String(s) => s.hash(state),
+            Value::Number(n) => n.to_string().hash(state),
+            Value::Boolean(b) => b.hash(state),
+            Value::Null => "null".hash(state),
+            Value::Object(o) => {
+                for (k, v) in o {
+                    k.hash(state);
+                    v.hash(state);
+                }
+            }
+            Value::Array(a) => {
+                for v in a {
+                    v.hash(state);
+                }
+            }
+            Value::Markdown(s, v) => {
+                s.hash(state);
+                v.hash(state);
+            }
+            Value::FixedJson(v, _) => v.hash(state),
+            Value::AnyOf(items, _) => {
+                for item in items {
+                    item.hash(state);
+                }
+            }
+        }
+    }
 }
 
 impl Value {
@@ -118,22 +155,27 @@ impl<'de> serde::Deserialize<'de> for Value {
     where
         D: serde::Deserializer<'de>,
     {
-        match serde_json::Value::deserialize(deserializer)? {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
             serde_json::Value::String(s) => Ok(Value::String(s)),
             serde_json::Value::Number(n) => Ok(Value::Number(n)),
             serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
             serde_json::Value::Null => Ok(Value::Null),
             serde_json::Value::Object(o) => {
-                let mut map = BamlMap::new();
+                let mut map = Vec::new();
                 for (k, v) in o {
-                    map.insert(k, serde_json::from_value(v).unwrap());
+                    let parsed_value =
+                        serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+                    map.push((k, parsed_value));
                 }
                 Ok(Value::Object(map))
             }
             serde_json::Value::Array(a) => {
                 let mut vec = Vec::new();
                 for v in a {
-                    vec.push(serde_json::from_value(v).unwrap());
+                    let parsed_value =
+                        serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+                    vec.push(parsed_value);
                 }
                 Ok(Value::Array(vec))
             }

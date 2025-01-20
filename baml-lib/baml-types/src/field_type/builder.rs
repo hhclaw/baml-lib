@@ -1,8 +1,20 @@
-use super::{FieldType, TypeValue};
+use super::{BamlMediaType, FieldType, TypeValue};
 
 impl FieldType {
     pub fn string() -> Self {
         FieldType::Primitive(TypeValue::String)
+    }
+
+    pub fn literal_string(value: String) -> Self {
+        FieldType::Literal(super::LiteralValue::String(value))
+    }
+
+    pub fn literal_int(value: i64) -> Self {
+        FieldType::Literal(super::LiteralValue::Int(value))
+    }
+
+    pub fn literal_bool(value: bool) -> Self {
+        FieldType::Literal(super::LiteralValue::Bool(value))
     }
 
     pub fn int() -> Self {
@@ -22,7 +34,7 @@ impl FieldType {
     }
 
     pub fn image() -> Self {
-        FieldType::Primitive(TypeValue::Image)
+        FieldType::Primitive(TypeValue::Media(BamlMediaType::Image))
     }
 
     pub fn r#enum(name: &str) -> Self {

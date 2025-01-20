@@ -7,6 +7,7 @@ mod test_expr;
 mod test_stmt;
 mod types;
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::Index;
 
@@ -14,9 +15,11 @@ use minijinja::machinery::{ast::Expr, Span};
 
 pub use self::types::Type;
 
-pub use self::types::PredefinedTypes;
+pub use self::types::{JinjaContext, PredefinedTypes};
 
 pub use self::stmt::get_variable_types;
+
+pub use self::expr::evaluate_type;
 
 #[derive(Debug, Clone)]
 pub struct TypeError {
@@ -87,7 +90,7 @@ impl TypeError {
 
         let message = if close_names.is_empty() {
             // If no names are close enough, suggest nothing or provide a generic message
-            format!("Variable `{}` does not exist.", name)
+            format!("Variable `{name}` does not exist.")
         } else if close_names.len() == 1 {
             // If there's only one close name, suggest it
             format!(
@@ -97,10 +100,7 @@ impl TypeError {
         } else {
             // If there are multiple close names, suggest them all
             let suggestions = close_names.join("`, `");
-            format!(
-                "Variable `{}` does not exist. Did you mean one of these: `{}`?",
-                name, suggestions
-            )
+            format!("Variable `{name}` does not exist. Did you mean one of these: `{suggestions}`?")
         };
 
         Self { message, span }
@@ -128,26 +128,65 @@ impl TypeError {
 
     fn new_missing_arg(func: &str, span: Span, name: &str) -> Self {
         Self {
-            message: format!("Function '{}' expects argument '{}'", func, name),
+            message: format!("Function '{func}' expects argument '{name}'"),
             span,
         }
     }
 
     fn new_wrong_arg_count(func: &str, span: Span, expected: usize, got: usize) -> Self {
         Self {
-            message: format!(
-                "Function '{}' expects {} arguments, but got {}",
-                func, expected, got
-            ),
+            message: format!("Function '{func}' expects {expected} arguments, but got {got}"),
             span,
         }
     }
 
-    fn new_unknown_arg(func: &str, span: Span, name: &str) -> Self {
-        Self {
-            message: format!("Function '{}' does not have an argument '{}'", func, name),
-            span,
-        }
+    fn new_unknown_arg(func: &str, span: Span, name: &str, valid_args: HashSet<&String>) -> Self {
+        let names = valid_args.into_iter().collect::<Vec<_>>();
+        let mut close_names = sort_by_match(name, &names, Some(3));
+        close_names.sort();
+        let close_names = close_names;
+
+        let message = if close_names.is_empty() {
+            // If no names are close enough, suggest nothing or provide a generic message
+            format!("Function '{func}' does not have an argument '{name}'.")
+        } else if close_names.len() == 1 {
+            // If there's only one close name, suggest it
+            format!(
+                "Function '{}' does not have an argument '{}'. Did you mean '{}'?",
+                func, name, close_names[0]
+            )
+        } else {
+            // If there are multiple close names, suggest them all
+            let suggestions = close_names.join("', '");
+            format!(
+                "Function '{func}' does not have an argument '{name}'. Did you mean one of these: '{suggestions}'?"
+            )
+        };
+
+        Self { message, span }
+    }
+
+    fn new_invalid_filter(name: &str, span: Span, valid_filters: &Vec<&str>) -> Self {
+        let mut close_names = sort_by_match(name, valid_filters, Some(5));
+        close_names.sort();
+        let close_names = close_names;
+
+        let message = if close_names.is_empty() {
+            // If no names are close enough, suggest nothing or provide a generic message
+            format!("Filter '{name}' does not exist")
+        } else if close_names.len() == 1 {
+            // If there's only one close name, suggest it
+            format!(
+                "Filter '{}' does not exist. Did you mean '{}'?",
+                name, close_names[0]
+            )
+        } else {
+            // If there are multiple close names, suggest them all
+            let suggestions = close_names.join("', '");
+            format!("Filter '{name}' does not exist. Did you mean one of these: '{suggestions}'?")
+        };
+
+        Self { message: format!("{message}\n\nSee: https://docs.rs/minijinja/latest/minijinja/filters/index.html#functions for the compelete list"), span }
     }
 
     fn new_invalid_type(expr: &Expr, got: &Type, expected: &str, span: Span) -> Self {
@@ -155,7 +194,7 @@ impl TypeError {
             message: format!(
                 "'{}' is {}, expected {}",
                 pretty_print::pretty_print(expr),
-                if *got == Type::Undefined {
+                if got.is_subtype_of(&Type::Undefined) {
                     "undefined".to_string()
                 } else {
                     format!("a {}", got.name())
@@ -192,8 +231,7 @@ impl TypeError {
     ) -> Self {
         Self {
             message: format!(
-                "class {} ({}) does not have a property '{}'",
-                class_name, variable_name, property
+                "class {class_name} ({variable_name}) does not have a property '{property}'"
             ),
             span,
         }
@@ -201,7 +239,7 @@ impl TypeError {
 
     fn new_class_not_defined(class: &str) -> Self {
         Self {
-            message: format!("Class '{}' is not defined", class),
+            message: format!("Class '{class}' is not defined"),
             span: Span::default(),
         }
     }

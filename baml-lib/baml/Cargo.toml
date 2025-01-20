@@ -25,12 +25,14 @@ crate-type = ["cdylib"]
 license-file.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 internal-baml-core = { path = "../baml-core" }
-internal-baml-jinja = { path = "../jinja" }
+internal-baml-jinja-types = { path = "../jinja" }
+internal-baml-jinja = { path = "../jinja-runtime" }
+internal-baml-parser-database = { path = "../parser-database" }
 jsonish = { path = "../jsonish" }
 baml-types = { path = "../baml-types" }
 anyhow = "1.0"
-either = "1.8.1"
 pyo3 = { version = "0.22.2", features = ["extension-module"] }
 
 [dev-dependencies]

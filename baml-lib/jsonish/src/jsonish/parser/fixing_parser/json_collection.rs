@@ -1,4 +1,5 @@
 use baml_types::BamlMap;
+use bstd::dedent;
 
 use crate::jsonish::Value;
 
@@ -8,7 +9,22 @@ pub enum JsonCollection {
     Object(Vec<String>, Vec<Value>),
     Array(Vec<Value>),
     QuotedString(String),
+    TripleQuotedString(String),
     SingleQuotedString(String),
+    // edge cases that need handling:
+    // - triple backticks in a triple backtick string
+    // - will the LLM terminate a triple backtick with a single backtick? probably not
+    // - do we give the language specifier out? no
+    // - what if the triple backtick block contains both a lang and path specifier? e.g. ```tsx path/to/file.tsx
+    //   should we hand back the path?
+    // - do we dedent the output?
+    // - is it an acceptable heuristic to discard the first line of a triple backtick block?
+    TripleBacktickString {
+        lang: Option<String>,
+        path: Option<String>,
+        content: String,
+    },
+    BacktickString(String),
     // Handles numbers, booleans, null, and unquoted strings
     UnquotedString(String),
     // Starting with // or #
@@ -24,6 +40,9 @@ impl JsonCollection {
             JsonCollection::Array(_) => "Array",
             JsonCollection::QuotedString(_) => "String",
             JsonCollection::SingleQuotedString(_) => "String",
+            JsonCollection::TripleBacktickString { .. } => "TripleBacktickString",
+            JsonCollection::BacktickString(_) => "String",
+            JsonCollection::TripleQuotedString(_) => "TripleQuotedString",
             JsonCollection::UnquotedString(_) => "UnquotedString",
             JsonCollection::TrailingComment(_) => "Comment",
             JsonCollection::BlockComment(_) => "Comment",
@@ -36,16 +55,26 @@ impl From<JsonCollection> for Option<Value> {
         Some(match collection {
             JsonCollection::TrailingComment(_) | JsonCollection::BlockComment(_) => return None,
             JsonCollection::Object(keys, values) => {
-                // log::info!("keys: {:?}", keys);
-                let mut object = BamlMap::new();
+                // log::debug!("keys: {:?}", keys);
+                let mut object = Vec::new();
                 for (key, value) in keys.into_iter().zip(values.into_iter()) {
-                    object.insert(key, value);
+                    object.push((key, value));
                 }
                 Value::Object(object)
             }
             JsonCollection::Array(values) => Value::Array(values),
             JsonCollection::QuotedString(s) => Value::String(s),
+            JsonCollection::TripleQuotedString(s) => Value::String(s),
             JsonCollection::SingleQuotedString(s) => Value::String(s),
+            JsonCollection::TripleBacktickString { content, .. } => {
+                let Some((fenced_codeblock_info, codeblock_contents)) = content.split_once("\n")
+                else {
+                    return Some(Value::String(content));
+                };
+
+                Value::String(dedent(codeblock_contents).content)
+            }
+            JsonCollection::BacktickString(s) => Value::String(s),
             JsonCollection::UnquotedString(s) => {
                 let s = s.trim();
                 if s == "true" {
@@ -59,7 +88,10 @@ impl From<JsonCollection> for Option<Value> {
                 } else if let Ok(n) = s.parse::<u64>() {
                     Value::Number(n.into())
                 } else if let Ok(n) = s.parse::<f64>() {
-                    Value::Number(serde_json::Number::from_f64(n).unwrap())
+                    match serde_json::Number::from_f64(n) {
+                        Some(n) => Value::Number(n),
+                        None => Value::String(s.into()),
+                    }
                 } else {
                     Value::String(s.into())
                 }

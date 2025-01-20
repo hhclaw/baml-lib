@@ -1,22 +1,23 @@
-use crate::{coerce, context::Context, types::StaticStringAttributes};
+use internal_baml_diagnostics::DatamodelError;
 
-pub(super) fn visit_description_attribute(
-    attributes: &mut StaticStringAttributes,
-    ctx: &mut Context<'_>,
-) {
-    match ctx
-        .visit_default_arg_with_idx("description")
-        .map(|(_, value)| coerce::string(value, ctx.diagnostics))
-    {
-        Ok(Some(description)) => {
-            if !attributes.add_meta(
-                ctx.interner.intern("description"),
-                ctx.interner.intern(description),
-            ) {
-                ctx.push_attribute_validation_error("Duplicate meta attribute.", true);
+use crate::{coerce, context::Context, types::Attributes};
+
+pub(super) fn visit_description_attribute(attributes: &mut Attributes, ctx: &mut Context<'_>) {
+    match ctx.visit_default_arg_with_idx("description") {
+        Ok((_, name)) => {
+            if attributes.description().is_some() {
+                ctx.push_attribute_validation_error("cannot be specified more than once", false);
+            } else if let Some(result) = name.to_unresolved_value(ctx.diagnostics) {
+                if result.as_str().is_some() {
+                    attributes.add_description(result);
+                } else {
+                    ctx.push_error(DatamodelError::new_validation_error(
+                        "must be a string.",
+                        result.meta().clone(),
+                    ));
+                }
             }
         }
         Err(err) => ctx.push_error(err), // not flattened for error handing legacy reasons
-        Ok(None) => (),
     };
 }

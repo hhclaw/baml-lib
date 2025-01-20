@@ -3,7 +3,7 @@ use crate::jsonish::Value;
 use super::{entry, ParseOptions};
 use anyhow::Result;
 
-pub fn parse<'a>(str: &'a str, options: &ParseOptions) -> Result<Vec<Value>> {
+pub fn parse(str: &str, options: &ParseOptions) -> Result<Vec<Value>> {
     // Find all balanced JSON objects but w/o any fixes.
     let mut stack = Vec::new();
     let mut json_str_start = None;
@@ -28,9 +28,12 @@ pub fn parse<'a>(str: &'a str, options: &ParseOptions) -> Result<Vec<Value>> {
                 }
 
                 if stack.is_empty() {
-                    // Assuming json_str_start is never None when stack is empty
                     let end_index = index + 1;
-                    let json_str = &str[json_str_start.unwrap()..end_index];
+                    let json_str = if let Some(start) = json_str_start {
+                        &str[start..end_index]
+                    } else {
+                        &str[..end_index]
+                    };
                     match entry::parse(
                         json_str,
                         options.next_from_mode(super::ParsingMode::AllJsonObjects),
@@ -49,15 +52,22 @@ pub fn parse<'a>(str: &'a str, options: &ParseOptions) -> Result<Vec<Value>> {
 
     if !stack.is_empty() {
         // We reached the end but the stack is not empty
-        let json_str = &str[json_str_start.unwrap()..];
-        match entry::parse(
-            json_str,
-            options.next_from_mode(super::ParsingMode::AllJsonObjects),
-        ) {
-            Ok(json) => json_objects.push(json),
-            Err(e) => {
-                // Ignore errors
-                log::error!("Failed to parse JSON object: {:?}", e);
+        match json_str_start {
+            Some(start) => {
+                let json_str = &str[start..];
+                match entry::parse(
+                    json_str,
+                    options.next_from_mode(super::ParsingMode::AllJsonObjects),
+                ) {
+                    Ok(json) => json_objects.push(json),
+                    Err(e) => {
+                        // Ignore errors
+                        log::error!("Failed to parse JSON object: {:?}", e);
+                    }
+                }
+            }
+            None => {
+                log::error!("Unexpected state: stack is not empty but no JSON start was found");
             }
         }
     }
