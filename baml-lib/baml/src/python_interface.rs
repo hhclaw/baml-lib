@@ -11,33 +11,41 @@ impl BamlLibError {
     }
 }
 
-
-#[pyo3::pyfunction]
-#[pyo3(signature = (schema_string, target_name=None, prefix=None, always_hoist_enums=None))]
-pub fn render_prompt(
-    schema_string: String,
-    target_name: Option<String>,
-    prefix: Option<String>,
-    always_hoist_enums: Option<bool>
-) -> pyo3::prelude::PyResult<String> {
-    let baml_context = BamlContext::try_from_schema(&schema_string, target_name)
-        .map_err(BamlLibError::from_anyhow)?;
-    baml_context
-        .render_prompt(prefix, always_hoist_enums)
-        .map_err(BamlLibError::from_anyhow)
+#[pyo3::prelude::pyclass]
+pub struct PyBamlContext {
+    context: BamlContext,
 }
 
-#[pyo3::pyfunction]
-#[pyo3(signature = (schema_string, result, target_name=None, allow_partials=None))]
-pub fn validate_result(
-    schema_string: String,
-    result: String,
-    target_name: Option<String>,
-    allow_partials: Option<bool>
-) -> pyo3::prelude::PyResult<String> {
-    let baml_context = BamlContext::try_from_schema(&schema_string, target_name)
-        .map_err(BamlLibError::from_anyhow)?;
-    baml_context
-        .validate_result(&result, allow_partials.unwrap_or(false))
-        .map_err(BamlLibError::from_anyhow)
+#[pyo3::prelude::pymethods]
+impl PyBamlContext {
+    #[new]
+    #[pyo3(signature= (schema_string, target_name=None))]
+    fn new(schema_string: String, target_name: Option<String>) -> pyo3::prelude::PyResult<Self> {
+        let context = BamlContext::try_from_schema(&schema_string, target_name)
+            .map_err(BamlLibError::from_anyhow)?;
+        Ok(PyBamlContext { context })
+    }
+
+    #[pyo3(signature = (prefix=None, always_hoist_enums=None))]
+    pub fn render_prompt(
+        &self,
+        prefix: Option<String>,
+        always_hoist_enums: Option<bool>
+    ) -> pyo3::prelude::PyResult<String> {
+        self.context
+            .render_prompt(prefix, always_hoist_enums)
+            .map_err(BamlLibError::from_anyhow)
+    }
+
+    #[pyo3(signature = (result, allow_partials=None))]
+    pub fn validate_result(
+        &self,
+        result: String,
+        allow_partials: Option<bool>
+    ) -> pyo3::prelude::PyResult<String> {
+        self.context
+            .validate_result(&result, allow_partials.unwrap_or(false))
+            .map_err(BamlLibError::from_anyhow)
+    }
 }
+

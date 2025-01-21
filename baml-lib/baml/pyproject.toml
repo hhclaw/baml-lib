@@ -1,8 +1,17 @@
 [project]
 name = "baml_lib"
-version = "0.41.0"
+version = "0.42.0"
 description = "BAML Library for Python"
 readme = "README.md"
+authors = [
+  {name = "hhclaw"}
+]
+keywords = ["baml", "llm"]
+
+[project.urls]
+Homepage = "https://github.com/hhclaw/baml-lib"
+Repository = "https://github.com/hhclaw/baml-lib"
+Issues = "https://github.com/hhclaw/baml-lib/issues"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
@@ -12,6 +21,3 @@ build-backend = "maturin"
 python-source = "src"
 # "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so).
 features = ["pyo3/extension-module"]
-
-[project.scripts]
-baml-cli = "baml_py:invoke_runtime_cli"

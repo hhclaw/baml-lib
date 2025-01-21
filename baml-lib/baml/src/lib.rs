@@ -2,12 +2,12 @@
 #![deny(rust_2018_idioms, unsafe_code)]
 
 use std::path::PathBuf;
-use baml_types::{BamlValue, FieldType, EvaluationContext};
+use baml_types::{BamlValue, FieldType, EvaluationContext, UnresolvedValue};
 use serde_json;
 use internal_baml_core::ast::{WithName, SubType};
 pub use internal_baml_core::{
     self,
-    internal_baml_diagnostics::{self, Diagnostics, SourceFile},
+    internal_baml_diagnostics::{self, Diagnostics, SourceFile, Span},
     internal_baml_parser_database::{self, TypeWalker},
     Configuration, ValidatedSchema,
 };
@@ -15,36 +15,21 @@ use internal_baml_jinja::types::{OutputFormatContent, RenderOptions, Name};
 mod type_convert;
 use type_convert::to_raw_field_type;
 
-/// Parse and analyze a Prisma schema.
-// pub fn parse_and_validate_schema(
-//     root_path: &PathBuf,
-//     files: impl Into<Vec<SourceFile>>,
-// ) -> Result<ValidatedSchema, Diagnostics> {
-//     let mut schema = validate(root_path, files.into());
-//     schema.diagnostics.to_result()?;
-//     Ok(schema)
-// }
-
 /// The most general API for dealing with Prisma schemas. It accumulates what analysis and
 /// validation information it can, and returns it along with any error and warning diagnostics.
 pub fn validate(schema_string: &String) -> ValidatedSchema {
-    let pathbuf = PathBuf::new();
+    let pathbuf = PathBuf::from("schema.baml");
     let file = SourceFile::from((&pathbuf, schema_string));
     internal_baml_core::validate(pathbuf.as_path(), vec![file])
 }
 
-// -------------------------------------------------------------------------------------------------
-// UNCOMMENT THIS BLOCK TO ENABLE PYTHON INTERFACE
-// Laminar specific Python interface
-
 use pyo3::prelude::PyModuleMethods;
-use python_interface::{render_prompt, validate_result};
+use python_interface::PyBamlContext;
 mod python_interface;
 
 #[pyo3::prelude::pymodule]
 fn baml_lib(m: &pyo3::Bound<'_, pyo3::prelude::PyModule>) -> pyo3::PyResult<()> {
-    m.add_function(pyo3::wrap_pyfunction!(render_prompt, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(validate_result, m)?)?;
+    m.add_class::<PyBamlContext>()?;
     Ok(())
 }
 
@@ -140,11 +125,18 @@ impl BamlContext {
         Ok(target)
     }
 
+    // The helper function
+    fn resolve_value(val: Option<&Option<UnresolvedValue<Span>>>) -> Option<String> {
+        let ctx = EvaluationContext::default();
+        val.and_then(|d| d.as_ref())
+           .and_then(|d_ref| d_ref.as_str())
+           .and_then(|r_str| r_str.resolve(&ctx).ok())
+    }
+
     fn build_output_format(
         validated_schema: &ValidatedSchema,
         target: FieldType,
     ) -> OutputFormatContent {
-        let ctx = EvaluationContext::default();
         let enums = validated_schema
             .db
             .walk_enums()
@@ -152,17 +144,14 @@ impl BamlContext {
                 let values = e.values()
                     .map(|v| {
                         let name = v.name().to_string();
-                        let alias = v.get_default_attributes()
-                            .map(|a| a.alias())
-                            .map(|al| al.as_ref().unwrap())
-                            .and_then(|d| d.as_str())
-                            .and_then(|r| r.resolve(&ctx).ok());
-                        let description = v
-                            .get_default_attributes()
+                        let alias = Self::resolve_value(
+                                v.get_default_attributes()
+                                .map(|a| a.alias())
+                        );
+                        let description = Self::resolve_value(
+                            v.get_default_attributes()
                             .map(|a| a.description())
-                            .map(|desc| desc.as_ref().unwrap())
-                            .map(|d| d.as_str())
-                            .and_then(|r| r?.resolve(&ctx).ok());
+                        );
                         // let doc = v.documentation().map(|d| d.to_string());
                         (internal_baml_jinja::types::Name::new(alias.unwrap_or(name)), description)
                     })
@@ -184,18 +173,14 @@ impl BamlContext {
                         let name = f.name().to_string();
                         let t = f.r#type().clone().expect(&format!("Cannot retrieve type from field {}", f.name()));
                         let field_type = to_raw_field_type(&t, &validated_schema.db);
-                        let alias = f.get_default_attributes()
-                            .map(|a| a.alias())
-                            .map(|al| al.as_ref().unwrap())
-                            .and_then(|d| d.as_str())
-                            .and_then(|r| r.resolve(&ctx).ok());
-
-                        let description = f
-                            .get_default_attributes()
+                        let alias = Self::resolve_value(
+                                f.get_default_attributes()
+                                .map(|a| a.alias())
+                        );
+                        let description = Self::resolve_value(
+                            f.get_default_attributes()
                             .map(|a| a.description())
-                            .map(|desc| desc.as_ref().unwrap())
-                            .and_then(|d| d.as_str())
-                            .and_then(|r| r.resolve(&ctx).ok());
+                        );
                         (internal_baml_jinja::types::Name::new(alias.unwrap_or(name)), field_type, description)
                     })
                     .collect::<Vec<_>>();
